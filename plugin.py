@@ -191,7 +191,12 @@ class PassportBridgePlugin(BasePlugin):
         
         async def _safe_start():
             await asyncio.sleep(0.3)
-            await self.server.start()
+            try:
+                await self.server.start()
+            except OSError as e:
+                log.warning(f"[Plugin:{self.plugin_id}] 启动局域网服务监听异常 (可能已有独立网关守护进程在运行): {e}")
+            except Exception as e:
+                log.warning(f"[Plugin:{self.plugin_id}] 服务启动遇到非致命异常: {e}")
 
         # 将服务端挂载到当前主 asyncio 事件循环中
         try:
