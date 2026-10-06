@@ -8,7 +8,6 @@ config.json
 
 # Binary firmware files
 *.bin
-firmware/*.bin
 
 # Logs
 *.log

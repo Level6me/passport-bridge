@@ -39,35 +39,13 @@
 
 ---
 
-## 🛠️ 硬件固件与树莓派刷机指南
+## 🛠️ 硬件固件说明
 
-本插件内置了完整的 ESP32-C3 PlatformIO 嵌入式源码工程，位于 `firmware/` 目录中：
+硬件端（ESP32-C3）固件已独立拆分并托管在专用的固件工程仓库（例如 `Letgo` / XiaoZhi 语音助手固件工程），包含 ST7789 屏幕、ES8311 音频编解码及 CW2017 电量计等完整板级驱动。
+- 板级定义目录：`main/boards/folotoy/ai-passport`
+- 固件编译命令：
+  ```bash
+  python scripts/build.py folotoy/ai-passport --name ai-passport
+  ```
 
-```text
-plugins/passport_bridge/
-├── manifest.json
-├── config.json
-├── plugin.py
-├── ws_server.py
-├── requirements.txt
-└── firmware/                     # ESP32-C3 固件工程
-    ├── platformio.ini
-    ├── flash_firmware.sh         # 树莓派/Linux 一键编译与烧录工具
-    ├── include/                  # 引脚定义与外设头文件 (ST7789, ES8311, I2S)
-    └── src/                      # 固件主控与 UI 渲染源码
-```
-
-### 1. 配置 Wi-Fi
-打开 `firmware/include/config.h`，填入你的局域网 Wi-Fi 名称与密码：
-```c
-#define DEFAULT_WIFI_SSID       "你的_WiFi_名称"
-#define DEFAULT_WIFI_PASSWORD   "你的_WiFi_密码"
-```
-
-### 2. 树莓派一键烧录
-用 Type-C 数据线将 AI Passport 插入树莓派 USB 端口，在终端直接运行：
-```bash
-cd firmware
-./flash_firmware.sh
-```
-脚本将自动安装 PlatformIO 工具链、识别串口并高速烧录固件。
+本仓库 `passport-bridge` 专注于提供服务端通信中继网关、局域网全双工通信、飞书机器人插件及交互式卡片控制台。
