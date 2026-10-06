@@ -3,19 +3,33 @@ __pycache__/
 *.py[cod]
 *$py.class
 
-# Config with possible local keys
+# Data & secrets
 config.json
+ha_token.txt
+data/
+*.token
+*.key
+*.secret
+
+# Backup files
+*.bak
+*.swp
+*~
+
+# Virtualenv
+venv/
+.venv/
+env/
+
+# PM2 & Logs
+*.log
+.pm2/
 
 # Binary firmware files
 *.bin
 
-# Logs
-*.log
-
 # OS & Editor
 .DS_Store
 Thumbs.db
-*.swp
-*~
 .vscode/
 .idea/
