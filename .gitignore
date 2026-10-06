@@ -1,0 +1,22 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Config with possible local keys
+config.json
+
+# Binary firmware files
+*.bin
+firmware/*.bin
+
+# Logs
+*.log
+
+# OS & Editor
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.vscode/
+.idea/
