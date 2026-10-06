@@ -16,18 +16,40 @@ FoloToy AI Passport 硬件随身对讲、全双工通信网关与飞书交互控
 
 ## 🚀 启动与部署
 
-### 1. 配置文件
-复制配置模板并填写飞书应用凭证：
+### 快速一键部署（一行命令）
+
+在目标 Linux / 树莓派设备上直接运行一键安装脚本（自动克隆代码、搭建虚拟环境、安装依赖并配置 PM2 进程守护）：
+
 ```bash
-cp config.example.json config.json
+# 私有仓库部署（推荐）：
+curl -fsSL -H "Authorization: token YOUR_GITHUB_TOKEN" \
+  https://raw.githubusercontent.com/Level6me/passport-bridge/main/install.sh | GITHUB_TOKEN=YOUR_GITHUB_TOKEN bash
+
+# 公开仓库部署：
+curl -fsSL https://raw.githubusercontent.com/Level6me/passport-bridge/main/install.sh | bash
 ```
 
-### 2. 依赖安装
-```bash
-pip install aiohttp lark-oapi edge-tts
-```
+> **提示**：安装完成后，编辑生成的 `config.json` 填入飞书凭证，执行 `pm2 restart passport-bridge` 即可。
 
-### 3. 运行服务 (PM2)
-```bash
-pm2 start server.py --name passport-bridge --interpreter python3
-```
+---
+
+### 手动部署流程
+
+1. **克隆代码与安装依赖**：
+   ```bash
+   git clone https://github.com/Level6me/passport-bridge.git
+   cd passport-bridge
+   python3 -m venv venv
+   ./venv/bin/pip install -r requirements.txt aiohttp lark-oapi edge-tts
+   ```
+
+2. **配置文件初始化**：
+   ```bash
+   cp config.example.json config.json
+   ```
+
+3. **PM2 守护进程启动**：
+   ```bash
+   pm2 start server.py --name passport-bridge --cwd $(pwd) --interpreter ./venv/bin/python3
+   pm2 save
+   ```
