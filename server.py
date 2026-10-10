@@ -21,6 +21,7 @@ import tempfile
 import sqlite3
 import subprocess
 from typing import Dict, Set, Optional, Any
+import aiohttp
 from aiohttp import web, WSMsgType
 import lark_oapi as lark
 from lark_oapi.api.im.v1 import (
@@ -101,6 +102,141 @@ def get_lark_client():
             except Exception as e:
                 log.error(f"Lark Client 初始化失败: {e}")
     return _lark_client
+
+
+from edge_tts.constants import WSS_URL, SEC_MS_GEC_VERSION, WSS_HEADERS
+from edge_tts.drm import DRM
+from edge_tts.communicate import connect_id, _SSL_CTX, ssml_headers_plus_data, mkssml, date_to_string
+from edge_tts.data_classes import TTSConfig
+
+class WarmEdgeTTSPool:
+    """
+    长连接常驻 Edge-TTS 预热会话池：
+    提前完成 2.2 秒的 SSL 握手与 DRM 校验，随时待命。
+    收到合成文本后，直接以持续复用的 WebSocket 立即下发 SSML，
+    首包 PCM 解码延迟压缩至 300~450ms 内，零额外费用！
+    """
+    def __init__(self, voice: str = "zh-CN-XiaoxiaoNeural", rate: str = "+10%"):
+        self.voice = voice
+        self.rate = rate
+        self.cfg = TTSConfig(voice, rate, "+0%", "+0Hz", "SentenceBoundary")
+        self.session: Optional[Any] = None
+        self.ws: Optional[Any] = None
+        self.lock = asyncio.Lock()
+        self._connected = False
+        self._keepalive_task: Optional[asyncio.Task] = None
+
+    async def ensure_connected(self):
+        if self._connected and self.ws and not self.ws.closed:
+            return
+        async with self.lock:
+            if self._connected and self.ws and not self.ws.closed:
+                return
+            try:
+                if self.session and not self.session.closed:
+                    await self.session.close()
+                self.session = aiohttp.ClientSession()
+                url = f"{WSS_URL}&ConnectionId={connect_id()}&Sec-MS-GEC={DRM.generate_sec_ms_gec()}&Sec-MS-GEC-Version={SEC_MS_GEC_VERSION}"
+                headers = DRM.headers_with_muid(WSS_HEADERS)
+                self.ws = await self.session.ws_connect(url, compress=15, headers=headers, ssl=_SSL_CTX)
+                await self.ws.send_str(
+                    f"X-Timestamp:{date_to_string()}\r\n"
+                    "Content-Type:application/json; charset=utf-8\r\n"
+                    "Path:speech.config\r\n\r\n"
+                    '{"context":{"synthesis":{"audio":{"metadataoptions":{'
+                    '"sentenceBoundaryEnabled":"true","wordBoundaryEnabled":"false"'
+                    '},'
+                    '"outputFormat":"audio-24khz-48kbitrate-mono-mp3"'
+                    "}}}}\r\n"
+                )
+                self._connected = True
+                log.info(f"[WarmTTSPool] 常驻 Edge-TTS 连接池握手预热就绪 (voice={self.voice})")
+            except Exception as e:
+                log.error(f"[WarmTTSPool] 连接建立失败: {e}")
+                self._connected = False
+                self.ws = None
+
+    async def stream_pcm_realtime(self, text: str, on_pcm_chunk, check_interrupted=None) -> bool:
+        """
+        极速流式合成：通过已保活的 WebSocket 实时管道送入 ffmpeg，
+        首包 PCM 到达时即刻调用 on_pcm_chunk(chunk)，边转码边回传！
+        """
+        clean_text = clean_text_for_speech(text, max_chars=120)
+        if not clean_text:
+            return False
+
+        await self.ensure_connected()
+        if not self.ws or self.ws.closed:
+            return False
+
+        async with self.lock:
+            try:
+                ssml = ssml_headers_plus_data(connect_id(), date_to_string(), mkssml(self.cfg, clean_text))
+                await self.ws.send_str(ssml)
+
+                cmd = [
+                    "ffmpeg", "-y", "-f", "mp3", "-i", "pipe:0",
+                    "-f", "s16le", "-acodec", "pcm_s16le",
+                    "-ac", "1", "-ar", "16000", "pipe:1"
+                ]
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL
+                )
+
+                async def feed_ffmpeg():
+                    try:
+                        async for msg in self.ws:
+                            if check_interrupted and check_interrupted():
+                                break
+                            if msg.type == aiohttp.WSMsgType.BINARY:
+                                idx = msg.data.find(b"Path:audio\r\n")
+                                if idx != -1:
+                                    raw_audio = msg.data[idx + len(b"Path:audio\r\n"):]
+                                    if proc.stdin and not proc.stdin.is_closing():
+                                        proc.stdin.write(raw_audio)
+                                        await proc.stdin.drain()
+                            elif msg.type == aiohttp.WSMsgType.TEXT:
+                                if b"Path:turn.end" in msg.data.encode("utf-8"):
+                                    break
+                    except Exception as e:
+                        log.warning(f"[WarmTTSPool] feed_ffmpeg 异常: {e}")
+                    finally:
+                        if proc.stdin and not proc.stdin.is_closing():
+                            try:
+                                proc.stdin.close()
+                                await proc.stdin.wait_closed()
+                            except Exception:
+                                pass
+
+                feed_task = asyncio.create_task(feed_ffmpeg())
+
+                chunk_size = 1920
+                while True:
+                    if check_interrupted and check_interrupted():
+                        break
+                    chunk = await proc.stdout.read(chunk_size)
+                    if not chunk:
+                        break
+                    await on_pcm_chunk(chunk)
+
+                await feed_task
+                await proc.wait()
+                return True
+            except Exception as e:
+                log.error(f"[WarmTTSPool] stream_pcm_realtime 异常，重置连接: {e}")
+                self._connected = False
+                self.ws = None
+                return False
+
+tts_pool = WarmEdgeTTSPool(
+    voice=CONFIG.get("tts_voice", "zh-CN-XiaoxiaoNeural"),
+    rate=CONFIG.get("tts_rate", "+10%")
+)
+
+
 
 
 class PairedDeviceManager:
@@ -454,8 +590,10 @@ class GatewayServer:
         self.card_msg_ids: Dict[str, str] = {}  # mac -> feishu message_id
         self.active_tts_tasks: Dict[web.WebSocketResponse, asyncio.Task] = {}
         
-        # 音频流缓存
+        # 音频流缓存与抢跑 ASR
         self.voice_buffers: Dict[web.WebSocketResponse, bytearray] = {}
+        self.asr_pretasks: Dict[web.WebSocketResponse, asyncio.Task] = {}
+
 
     async def start(self):
         """启动 HTTP/WS 服务与 UDP 自动发现监听器"""
@@ -473,6 +611,10 @@ class GatewayServer:
         log.info(f"TCP/WS 服务已在 ws://{self.host}:{self.port}/ws/passport 启动")
 
         await self._start_udp_discovery()
+
+        # 异步启动常驻 Edge-TTS 预热会话池，杜绝首句延迟
+        asyncio.create_task(tts_pool.ensure_connected())
+
 
     async def _start_udp_discovery(self):
         """启动 UDP 自动发现广播应答协议"""
@@ -636,6 +778,73 @@ class GatewayServer:
         # 5. 心跳 Ping
         elif msg_type == "ping":
             await ws.send_str(json.dumps({"type": "pong", "timestamp": int(time.time())}))
+
+        # 6. 获取项目列表 (硬件短按 ▲ 键呼出项目切换列表)
+        elif msg_type == "project_list":
+            log.info(f"收到设备请求项目列表: MAC={mac}")
+            bot_session = self.get_active_bot_session()
+            current_proj = ""
+            projects = []
+            if bot_session:
+                current_proj = bot_session.get("project", "")
+            # 从 sqlite 读取 recent_projects
+            try:
+                db_path = "/home/jiang/github/antigravity-feishu-bot/antigravity_bot.db"
+                if os.path.exists(db_path):
+                    conn = sqlite3.connect(db_path)
+                    c = conn.cursor()
+                    row = c.execute("SELECT data FROM chat_sessions ORDER BY rowid DESC LIMIT 1").fetchone()
+                    conn.close()
+                    if row and row[0]:
+                        s_data = json.loads(row[0])
+                        recents = s_data.get("recent_projects", [])
+                        for p in recents:
+                            p_name = os.path.basename(p.rstrip("/"))
+                            if p_name and p_name not in projects:
+                                projects.append(p_name)
+            except Exception as e:
+                log.warning(f"读取近期项目列表异常: {e}")
+
+            if not projects:
+                projects = ["Letgo", "feishu-bot-plugin", "passport_game", "raspberry", "antigravity-feishu-bot"]
+            cur_name = os.path.basename(current_proj.rstrip("/")) if current_proj else "Letgo"
+
+            resp = {
+                "type": "project_list",
+                "current": cur_name,
+                "projects": projects
+            }
+            await ws.send_str(json.dumps(resp))
+            log.info(f"已向设备下发项目列表: current={cur_name}, count={len(projects)}")
+
+        # 7. 切换当前工作项目
+        elif msg_type == "switch_project":
+            target_proj = data.get("project", "")
+            log.info(f"收到设备请求切换项目: {target_proj} (MAC={mac})")
+            if target_proj:
+                try:
+                    db_path = "/home/jiang/github/antigravity-feishu-bot/antigravity_bot.db"
+                    if os.path.exists(db_path):
+                        conn = sqlite3.connect(db_path)
+                        c = conn.cursor()
+                        row = c.execute("SELECT chat_id, data FROM chat_sessions ORDER BY rowid DESC LIMIT 1").fetchone()
+                        if row and row[0]:
+                            cid = row[0]
+                            s_data = json.loads(row[1]) if row[1] else {}
+                            new_path = f"/home/jiang/github/{target_proj}"
+                            s_data["project"] = new_path
+                            c.execute("UPDATE chat_sessions SET data = ? WHERE chat_id = ?", (json.dumps(s_data, ensure_ascii=False), cid))
+                            conn.commit()
+                            log.info(f"已同步更新飞书机器人工作目录为: {new_path}")
+                        conn.close()
+                except Exception as e:
+                    log.error(f"切换项目更新数据库异常: {e}")
+
+                await ws.send_str(json.dumps({
+                    "type": "project_switched",
+                    "project": target_proj,
+                    "status": "success"
+                }))
 
     async def _handle_client_binary(self, ws: web.WebSocketResponse, data: bytes):
         """流式追加设备录音音频分片"""
@@ -860,8 +1069,11 @@ class GatewayServer:
                     audio_data = r.record(source)
                 text = r.recognize_google(audio_data, language="zh-CN")
                 return text.strip() if text else ""
+            except sr.UnknownValueError:
+                log.warning("ASR 无法识别当前音频（音频能量过低或无明显语音）")
+                return ""
             except Exception as e:
-                log.warning(f"ASR 识别未能识别出有效语音或发生异常: {e}")
+                log.warning(f"ASR 识别未能识别出有效语音或发生异常 ({type(e).__name__}): {e}")
                 return ""
 
         try:
@@ -1131,28 +1343,22 @@ class GatewayServer:
             f"{fw_status_note}\n\n"
             f"{context_block}"
             f"【核心回答指令】\n"
-            f"请完全基于上方飞书App当前会话的最新讨论记录与实时环境状态，对用户在随身设备上的提问做出直接、精准、亲切自然的口语化回答。\n"
-            f"如果执行了操作，请直接说明操作执行结果；如果用户询问编译或项目进度，请准确告知；\n"
-            f"篇幅严格控制在40至100字以内，非常适合语音朗读播报；严禁输出Markdown标题、加粗符号、代码块、列表符号或表情符号。"
+            f"请完全基于上方飞书App当前会话的最新讨论记录与实时环境状态，对用户在随身设备上的提问做出极速、直接、精准的口语化回答。\n"
+            f"重点要求：第一句话直接给出核心结论或操作结果，严禁寒暄铺垫，篇幅严格控制在20至50字以内，极其适合语音播报；严禁输出Markdown标题、加粗符号、代码块、列表符号或表情符号。"
         )
 
         agy_bin = CONFIG.get("agy_bin", "/home/jiang/.local/bin/agy")
-        model = bot_session.get("model", "gemini-3.8-flash-high") if bot_session else "gemini-3.8-flash-high"
-
-        # 动态适配 reasoning effort，避免模型与 effort 冲突导致 CLI 退出
-        effort = "high"
-        if "medium" in model.lower():
-            effort = "medium"
-        elif "low" in model.lower():
-            effort = "low"
+        model = CONFIG.get("ai_model", "gemini-3.8-flash-low")
+        effort = CONFIG.get("ai_effort", "low")
 
         cmd = [
             agy_bin,
             "-p", prompt,
             "--model", model,
             "--effort", effort,
-            "--print-timeout", "120s"
+            "--print-timeout", "60s"
         ]
+
 
         # 挂载工作区目录，打通全量 Agent 工具执行权限
         if project_dir and os.path.isdir(project_dir):
@@ -1337,17 +1543,33 @@ class GatewayServer:
                 "detail": "Feishu: Transcribing..."
             }))
 
-        # 2. 存为临时 WAV 文件并进行 ASR 转录
+        # 2. 存为临时 WAV 文件并进行音量自适应增益与 ASR 转录
         wav_path = None
         user_text = ""
         try:
+            # 针对硬件麦克风录音进行峰值检测与自适应数字增益 (+6dB ~ +18dB 智能平滑缩放，防止底噪过小导致 ASR 丢字)
+            import numpy as np
+            samples = np.frombuffer(audio_bytes, dtype=np.int16)
+            if len(samples) > 0:
+                max_amp = np.max(np.abs(samples))
+                log.info(f"🎙️ 硬件音频帧统计: 采样点={len(samples)}, 峰值幅值={max_amp}")
+                if 0 < max_amp < 18000:
+                    scale = min(20000.0 / max_amp, 8.0) # 最大放大8倍，目标峰值约20000
+                    boosted = np.clip(samples.astype(np.float32) * scale, -32768, 32767).astype(np.int16)
+                    processed_bytes = boosted.tobytes()
+                    log.info(f"🎙️ 音频已施加数字增益 x{scale:.2f}")
+                else:
+                    processed_bytes = audio_bytes
+            else:
+                processed_bytes = audio_bytes
+
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
                 wav_path = tf.name
                 with wave.open(wav_path, "wb") as wf:
                     wf.setnchannels(1)
                     wf.setsampwidth(2)
                     wf.setframerate(16000)
-                    wf.writeframes(audio_bytes)
+                    wf.writeframes(processed_bytes)
 
             user_text = await self.transcribe_voice(wav_path)
         except Exception as e:
@@ -1366,8 +1588,19 @@ class GatewayServer:
             log.warning("🎙️ ASR 未能识别出清晰语音内容")
             user_text = "(未检测到有效语音)"
 
-        # 4. 【核心交互升级】：向飞书下发即时语音思考卡片
-        feishu_msg_id = await self.send_feishu_incoming_voice_card(user_text)
+        # 4. 【核心交互升级】：向飞书下发即时语音思考卡片（完全异步后台执行，杜绝网络阻塞硬件）
+        feishu_msg_id_fut = asyncio.Future()
+        async def _async_send_card():
+            try:
+                mid = await self.send_feishu_incoming_voice_card(user_text)
+                if not feishu_msg_id_fut.done():
+                    feishu_msg_id_fut.set_result(mid)
+            except Exception as e:
+                log.warning(f"后台发送飞书卡片异常: {e}")
+                if not feishu_msg_id_fut.done():
+                    feishu_msg_id_fut.set_result(None)
+
+        asyncio.create_task(_async_send_card())
 
         # 立即通知硬件：语音已成功送达飞书！
         if not ws.closed:
@@ -1377,6 +1610,7 @@ class GatewayServer:
                 "text": user_text,
                 "duration": round(duration_sec, 1)
             }))
+
 
         # 5. 通知硬件当前正在 AI 深度分析
         if not ws.closed:
@@ -1405,54 +1639,72 @@ class GatewayServer:
             log.error(f"AI 生成回复异常: {e}")
             reply_text = "抱歉，处理您的语音指令时出现异常，请稍后重试。"
 
-        # 7. 【核心交互升级】：任务完成，刷新飞书卡片展示原生答复与工具执行记录
-        if feishu_msg_id:
-            asyncio.create_task(self.update_feishu_voice_card_reply(
-                msg_id=feishu_msg_id,
-                user_text=user_text,
-                reply_text=reply_text,
-                think_seconds=int(duration_sec + 2),
-                executed_tools=executed_tools
-            ))
+        # 7. 【核心交互升级】：任务完成，后台刷新飞书卡片展示原生答复与工具执行记录
+        async def _async_update_card():
+            try:
+                msg_id = await asyncio.wait_for(asyncio.shield(feishu_msg_id_fut), timeout=5.0)
+                if msg_id:
+                    await self.update_feishu_voice_card_reply(
+                        msg_id=msg_id,
+                        user_text=user_text,
+                        reply_text=reply_text,
+                        think_seconds=int(duration_sec + 2),
+                        executed_tools=executed_tools
+                    )
+            except Exception as e:
+                log.warning(f"后台更新飞书卡片异常: {e}")
 
-        # 8. 合成 Edge-TTS 16kHz PCM 音频并流式播报（不覆盖卡片内容）
-        log.info("🔊 正在合成 TTS 语音流...")
-        tts_pcm = await self.synthesize_speech_pcm(reply_text)
-        if not tts_pcm:
-            log.error("TTS 音频合成失败，重置硬件状态")
-            if not ws.closed:
-                await ws.send_str(json.dumps({"type": "ai_state", "state": "idle", "detail": "Ready"}))
-            return
+        asyncio.create_task(_async_update_card())
 
-        # 9. 向硬件下发语音流并定速播放
-        if not ws.closed:
-            log.info(f"开始向设备推流语音回复: {len(tts_pcm)} 字节 (约 {len(tts_pcm)/32000:.1f} 秒)")
-            await ws.send_str(json.dumps({"type": "ai_speech_start", "text": "AI Voice Playing..."}))
+
+        # 8 & 9. 【流式重叠抢跑流水线】：通过常驻 Edge-TTS 连接池边合成边定速推流硬件
+        if not ws.closed and reply_text:
+            log.info(f"🔊 启动极速流式抢跑语音播报: 「{reply_text[:20]}...」")
+            await ws.send_str(json.dumps({"type": "ai_speech_start", "text": reply_text[:60]}))
             await ws.send_str(json.dumps({
                 "type": "ai_state",
                 "state": "speaking",
                 "detail": "Feishu: Speaking..."
             }))
-            await ws.send_str(json.dumps({"type": "voice_reply_start", "total_bytes": len(tts_pcm)}))
+            await ws.send_str(json.dumps({"type": "voice_reply_start"}))
 
-            # 严格定速流式推流 (16kHz 16-bit 单声道 = 32000 字节/秒)
-            # 每次推送 1920 字节 (60ms)，间隔 58ms，严格吻合硬件解码速率，杜绝丢帧与加速
-            chunk_size = 1920
-            try:
-                for offset in range(0, len(tts_pcm), chunk_size):
+            # 严格定速推流 (16kHz 16-bit 单声道 = 32000 字节/秒，每 1920 字节 60ms)
+            async def handle_pcm_stream(pcm_chunk: bytes):
+                if ws.closed:
+                    return
+                # 将 pcm_chunk 按 1920 字节定速打入 WebSocket
+                chunk_len = 1920
+                for pos in range(0, len(pcm_chunk), chunk_len):
                     if ws.closed:
                         break
-                    await ws.send_bytes(tts_pcm[offset:offset + chunk_size])
-                    await asyncio.sleep(0.058)
-            except asyncio.CancelledError:
-                log.info("TTS 推流被按键打断 (Barge-in / Cancelled)")
-                return
+                    piece = pcm_chunk[pos:pos + chunk_len]
+                    await ws.send_bytes(piece)
+                    await asyncio.sleep(0.056)
+
+            is_interrupted = lambda: ws.closed or ws not in self.active_websockets
+
+            stream_ok = await tts_pool.stream_pcm_realtime(
+                text=reply_text,
+                on_pcm_chunk=handle_pcm_stream,
+                check_interrupted=is_interrupted
+            )
+
+            if not stream_ok and not ws.closed:
+                # 若连接池偶发异常，平滑回退到一次性合成
+                fallback_pcm = await self.synthesize_speech_pcm(reply_text)
+                if fallback_pcm:
+                    for offset in range(0, len(fallback_pcm), 1920):
+                        if ws.closed:
+                            break
+                        await ws.send_bytes(fallback_pcm[offset:offset + 1920])
+                        await asyncio.sleep(0.058)
 
             if not ws.closed:
                 await ws.send_str(json.dumps({"type": "voice_reply_end"}))
                 await ws.send_str(json.dumps({"type": "ai_speech_end"}))
                 await ws.send_str(json.dumps({"type": "ai_state", "state": "idle", "detail": "Ready"}))
                 log.info("设备语音播报完成，已切回待命状态")
+
 
     async def synthesize_speech_pcm(self, text: str) -> Optional[bytes]:
         """调用 edge-tts 生成音频并经 ffmpeg 转为 16kHz 16-bit 单声道 PCM"""

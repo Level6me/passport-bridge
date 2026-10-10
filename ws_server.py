@@ -77,6 +77,7 @@ class PassportServer:
         self.voice_buffers: Dict[web.WebSocketResponse, bytearray] = {}
         self.tts_interrupted: Dict[web.WebSocketResponse, bool] = {}
         self.pending_2fa_futures: Dict[str, asyncio.Future] = {}
+        self.last_spoken_text: str = ""
         
         self._dashboard_task: Optional[asyncio.Task] = None
         self._running = False
@@ -292,9 +293,14 @@ class PassportServer:
                 else:
                     await self.broadcast_ai_state("idle", "")
             elif action == "double_click":
-                # 动作宏 1: OK 键双击 -> 飞书快捷签到打卡
-                log.info("[PassportBridge] 触发动作宏: [OK 双击] -> 飞书快捷签到打卡")
-                await self._execute_macro_action("ok_double_click", "飞书工作台状态签到")
+                # OK 键双击 -> 重播上一句语音回答；若暂无历史则广播提示
+                if self.last_spoken_text:
+                    log.info(f"[PassportBridge] 触发动作: [OK 双击] -> 重新播报上一句: {self.last_spoken_text[:15]}...")
+                    await self.broadcast_alert("🔄 正在重新播报", self.last_spoken_text[:30], level="info", duration_sec=2)
+                    asyncio.create_task(self._synthesize_and_stream_tts(ws, self.last_spoken_text))
+                else:
+                    log.info("[PassportBridge] 触发动作: [OK 双击] -> 暂无上一句播报记录")
+                    await self.broadcast_alert("提示", "暂无上一句语音播报记录", level="info", duration_sec=2)
 
         elif btn == "up":
             if action == "short_press":
@@ -705,6 +711,8 @@ class PassportServer:
         if not spoken_text:
             await self.broadcast_ai_state("idle", "")
             return
+
+        self.last_spoken_text = spoken_text
 
         # 告知硬件进入播报状态与字幕
         await self.send_json(ws, {
