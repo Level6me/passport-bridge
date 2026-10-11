@@ -165,14 +165,31 @@ class WarmEdgeTTSPool:
         if not clean_text:
             return False
 
-        await self.ensure_connected()
-        if not self.ws or self.ws.closed:
-            return False
-
         async with self.lock:
             try:
+                if not self._connected or not self.ws or self.ws.closed:
+                    self._connected = False
+                    if self.session and not self.session.closed:
+                        await self.session.close()
+                    self.session = aiohttp.ClientSession()
+                    url = f"{WSS_URL}&ConnectionId={connect_id()}&Sec-MS-GEC={DRM.generate_sec_ms_gec()}&Sec-MS-GEC-Version={SEC_MS_GEC_VERSION}"
+                    headers = DRM.headers_with_muid(WSS_HEADERS)
+                    self.ws = await self.session.ws_connect(url, compress=15, headers=headers, ssl=_SSL_CTX)
+                    await self.ws.send_str(
+                        f"X-Timestamp:{date_to_string()}\r\n"
+                        "Content-Type:application/json; charset=utf-8\r\n"
+                        "Path:speech.config\r\n\r\n"
+                        '{"context":{"synthesis":{"audio":{"metadataoptions":{'
+                        '"sentenceBoundaryEnabled":"true","wordBoundaryEnabled":"false"'
+                        '},'
+                        '"outputFormat":"audio-24khz-48kbitrate-mono-mp3"'
+                        "}}}}\r\n"
+                    )
+                    self._connected = True
+
                 ssml = ssml_headers_plus_data(connect_id(), date_to_string(), mkssml(self.cfg, clean_text))
                 await self.ws.send_str(ssml)
+
 
                 cmd = [
                     "ffmpeg", "-y", "-f", "mp3", "-i", "pipe:0",
@@ -1629,12 +1646,13 @@ class GatewayServer:
                 reply_text, executed_tools = await self.generate_ai_reply(
                     user_query=user_text,
                     mac=mac,
-                    feishu_msg_id=feishu_msg_id,
+                    feishu_msg_id="",
                     duration_sec=duration_sec
                 )
                 log.info(f"🤖 AI 生成回复: 「{reply_text}」 (实际执行工具数: {len(executed_tools)})")
             else:
                 reply_text = "我没有听清您的说话内容，请长按确认键重新对我说话。"
+
         except Exception as e:
             log.error(f"AI 生成回复异常: {e}")
             reply_text = "抱歉，处理您的语音指令时出现异常，请稍后重试。"
