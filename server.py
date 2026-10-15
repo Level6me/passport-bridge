@@ -784,6 +784,7 @@ class GatewayServer:
         self.card_msg_ids: Dict[str, str] = {}  # mac -> feishu message_id
         self.active_tts_tasks: Dict[web.WebSocketResponse, asyncio.Task] = {}
         self.active_ai_procs: Dict[web.WebSocketResponse, asyncio.subprocess.Process] = {}
+        self._active_broadcast_task: Optional[asyncio.Task] = None
         
         # 音频流缓存与抢跑 ASR
         self.voice_buffers: Dict[web.WebSocketResponse, bytearray] = {}
@@ -828,6 +829,9 @@ class GatewayServer:
         if tts_task and not tts_task.done():
             tts_task.cancel()
             log.info("⚡ [深度熔断] 已中断正在进行的 TTS 与音频推流任务")
+        if hasattr(self, "_active_broadcast_task") and self._active_broadcast_task and not self._active_broadcast_task.done():
+            self._active_broadcast_task.cancel()
+            log.info("⚡ [深度熔断] 已中断正在进行的全局语音广播推流任务")
 
         # 3. 清理录音缓存与 ASR 任务
         self.voice_buffers.pop(ws, None)
@@ -1138,12 +1142,29 @@ class GatewayServer:
                     asyncio.create_task(self.send_feishu_card_to_chat(cid, card))
 
     async def _handle_client_binary(self, ws: web.WebSocketResponse, data: bytes):
-        """流式追加设备录音音频分片"""
+        """流式追加设备录音音频分片并进行最大长度安全截断保护"""
         if ws in self.voice_buffers:
-            self.voice_buffers[ws].extend(data)
-            cur_len = len(self.voice_buffers[ws])
+            # 单次录音上限保护：16kHz 16bit 单声道 60秒 = 1,920,000 字节 (~1.83MB)
+            max_audio_bytes = CONFIG.get("max_audio_buffer_bytes", 1920000)
+            buf = self.voice_buffers[ws]
+            cur_len = len(buf)
+
+            if cur_len >= max_audio_bytes:
+                # 已经达到或超过上限，主动截断丢弃后续分片，防止内存无上限膨胀
+                if cur_len == max_audio_bytes or (cur_len - len(data) < max_audio_bytes):
+                    log.warning(f"⚠️ 硬件音频缓冲已达到最大上限 ({max_audio_bytes} 字节, 约 {max_audio_bytes/32000:.0f}s)，后续音频分片已自动截断抛弃")
+                return
+
+            remaining = max_audio_bytes - cur_len
+            if len(data) > remaining:
+                buf.extend(data[:remaining])
+                log.warning(f"⚠️ 硬件音频缓冲写入触发截断保护，达到上限 {max_audio_bytes} 字节")
+            else:
+                buf.extend(data)
+
+            cur_len = len(buf)
             if cur_len % 32000 < len(data):
-                log.info(f"🎙️ 正在流式接收音频，当前累积: {cur_len} 字节")
+                log.info(f"🎙️ 正在流式接收音频，当前累积: {cur_len} 字节 (约 {cur_len/32000:.1f}s)")
         else:
             log.warning(f"⚠️ 收到二进制音频分片 ({len(data)} 字节)，但 ws 不在 voice_buffers 中！")
 
@@ -2975,35 +2996,193 @@ class GatewayServer:
             return web.json_response({"success": True})
         return web.json_response({"success": False, "error": "Missing mac"}, status=400)
 
+    def split_text_for_broadcast(self, text: str) -> List[str]:
+        """将待播报长文本智能切分成适合朗读与屏幕滚动展示的短句列表"""
+        if not text:
+            return []
+        cleaned_full = clean_text_for_speech(text, max_chars=4000)
+        if not cleaned_full:
+            return []
+        chunker = SentenceChunker()
+        raw_sentences = chunker.feed(cleaned_full)
+        raw_sentences.extend(chunker.flush())
+        sentences = []
+        for s in raw_sentences:
+            cs = s.strip()
+            if cs:
+                sentences.append(cs)
+        return sentences
+
     async def play_voice_to_all(self, text: str):
-        """向所有在线硬件设备流式播放文本语音"""
+        """
+        向所有在线硬件设备流式分句播放文本语音：
+        1. 采用 SentenceChunker 智能分句，单句控制在适度长度；
+        2. 双协程异步预合成流水线 (Prefetch Pipeline)：边播放当前句，边预加载下一句，杜绝卡顿；
+        3. 每句只向硬件发送当前句字幕，杜绝超长字符串撑爆 LVGL 或触发硬件看门狗；
+        4. 硬件端连续接收 PCM 音频流无缝拼接，播放顺滑连贯。
+        """
+        if hasattr(self, "_active_broadcast_task") and self._active_broadcast_task and not self._active_broadcast_task.done():
+            self._active_broadcast_task.cancel()
+            log.info("📢 中止上一轮未完成的语音广播推流任务")
+
+        task = asyncio.current_task()
+        self._active_broadcast_task = task
+
         try:
-            pcm = await self.synthesize_speech_pcm(text)
-            if not pcm:
+            sentences = self.split_text_for_broadcast(text)
+            if not sentences:
+                log.warning("播报文本切句后为空，取消播报")
                 return
-            for ws in list(self.active_websockets):
-                if ws.closed:
-                    continue
+
+            log.info(f"📢 [流式语音广播] 待播报文本切分为 {len(sentences)} 个分句，启动流水线推流")
+
+            audio_packet_queue: asyncio.Queue = asyncio.Queue(maxsize=2)
+            interrupted_ev = asyncio.Event()
+
+            def is_interrupted() -> bool:
+                if interrupted_ev.is_set():
+                    return True
+                alive = [w for w in self.active_websockets if not w.closed]
+                return len(alive) == 0
+
+            # 协程1：后台异步预合成流水线
+            async def producer():
                 try:
-                    await ws.send_str(json.dumps({"type": "ai_speech_start", "text": text}))
-                    await ws.send_str(json.dumps({"type": "voice_reply_start"}))
-                    chunk_len = 1920
-                    for pos in range(0, len(pcm), chunk_len):
-                        if ws.closed:
+                    for idx, sentence_text in enumerate(sentences):
+                        if is_interrupted():
                             break
-                        piece = pcm[pos:pos + chunk_len]
-                        if len(piece) < chunk_len:
-                            piece = piece + b"\x00" * (chunk_len - len(piece))
-                        await ws.send_bytes(piece)
-                        await asyncio.sleep(0.056)
-                    if not ws.closed:
-                        await ws.send_str(json.dumps({"type": "voice_reply_end"}))
-                        await ws.send_str(json.dumps({"type": "ai_speech_end"}))
-                        await ws.send_str(json.dumps({"type": "ai_state", "state": "idle", "detail": "Ready"}))
-                except Exception as e_ws:
-                    log.warning(f"向设备播放语音异常: {e_ws}")
+                        log.info(f"🎙️ [广播合成] 正在预合成第 {idx+1}/{len(sentences)} 句: 「{sentence_text}」")
+                        
+                        pcm_buf = bytearray()
+                        async def _on_pcm_chunk(chunk: bytes):
+                            pcm_buf.extend(chunk)
+
+                        stream_ok = False
+                        try:
+                            stream_ok = await tts_pool.stream_pcm_realtime(
+                                text=sentence_text,
+                                on_pcm_chunk=_on_pcm_chunk,
+                                check_interrupted=is_interrupted
+                            )
+                        except Exception as e_stream:
+                            log.warning(f"tts_pool 流式合成异常: {e_stream}")
+
+                        if (not stream_ok or len(pcm_buf) == 0) and not is_interrupted():
+                            log.info(f"降级采用单句直接合成: 「{sentence_text}」")
+                            fallback_pcm = await self.synthesize_speech_pcm(sentence_text)
+                            if fallback_pcm:
+                                pcm_buf = bytearray(fallback_pcm)
+
+                        if len(pcm_buf) > 0 and not is_interrupted():
+                            await audio_packet_queue.put((sentence_text, bytes(pcm_buf)))
+                        elif not is_interrupted():
+                            log.warning(f"分句合成音频为空，跳过该句: 「{sentence_text}」")
+                except asyncio.CancelledError:
+                    pass
+                except Exception as e_prod:
+                    log.error(f"广播音频合成流水线异常: {e_prod}")
+                finally:
+                    await audio_packet_queue.put(None)
+
+            # 协程2：定速推流消费者
+            async def consumer():
+                speech_started = False
+                try:
+                    while not is_interrupted():
+                        packet = await audio_packet_queue.get()
+                        if packet is None:
+                            break
+                        sentence_text, pcm_data = packet
+
+                        alive_ws = [w for w in list(self.active_websockets) if not w.closed]
+                        if not alive_ws:
+                            break
+
+                        if not speech_started:
+                            speech_started = True
+                            for ws in alive_ws:
+                                try:
+                                    await ws.send_str(json.dumps({
+                                        "type": "ai_state",
+                                        "state": "speaking",
+                                        "detail": "Broadcast: Speaking..."
+                                    }))
+                                    await ws.send_str(json.dumps({"type": "voice_reply_start"}))
+                                except Exception:
+                                    pass
+
+                        # 向硬件下发当前短句字幕
+                        for ws in alive_ws:
+                            try:
+                                await ws.send_str(json.dumps({
+                                    "type": "ai_speech_start",
+                                    "text": sentence_text
+                                }))
+                            except Exception:
+                                pass
+
+                        # 严格定速推流当前句 PCM 帧 (每 1920 字节 60ms)
+                        chunk_len = 1920
+                        for pos in range(0, len(pcm_data), chunk_len):
+                            if is_interrupted():
+                                break
+                            piece = pcm_data[pos:pos + chunk_len]
+                            if len(piece) < chunk_len:
+                                piece = piece + b"\x00" * (chunk_len - len(piece))
+                            for ws in list(self.active_websockets):
+                                if not ws.closed:
+                                    try:
+                                        await ws.send_bytes(piece)
+                                    except Exception:
+                                        pass
+                            await asyncio.sleep(0.056)
+
+                        audio_packet_queue.task_done()
+                except asyncio.CancelledError:
+                    pass
+                except Exception as e_cons:
+                    log.error(f"广播推流异常: {e_cons}")
+                finally:
+                    alive_ws = [w for w in list(self.active_websockets) if not w.closed]
+                    if speech_started and not is_interrupted():
+                        for ws in alive_ws:
+                            try:
+                                await ws.send_str(json.dumps({"type": "voice_reply_end"}))
+                                await ws.send_str(json.dumps({"type": "ai_speech_end"}))
+                                await ws.send_str(json.dumps({
+                                    "type": "ai_state",
+                                    "state": "idle",
+                                    "detail": "Ready"
+                                }))
+                            except Exception:
+                                pass
+                        log.info("📢 流式语音广播顺利完成，所有设备已切回待命")
+                    elif speech_started and is_interrupted():
+                        for ws in alive_ws:
+                            try:
+                                await ws.send_str(json.dumps({"type": "voice_reply_end"}))
+                                await ws.send_str(json.dumps({"type": "ai_speech_end"}))
+                                await ws.send_str(json.dumps({
+                                    "type": "ai_state",
+                                    "state": "idle",
+                                    "detail": "Ready"
+                                }))
+                            except Exception:
+                                pass
+
+            prod_task = asyncio.create_task(producer())
+            cons_task = asyncio.create_task(consumer())
+            try:
+                await asyncio.gather(prod_task, cons_task)
+            except asyncio.CancelledError:
+                interrupted_ev.set()
+                prod_task.cancel()
+                cons_task.cancel()
+                raise
+        except asyncio.CancelledError:
+            log.info("📢 语音广播任务已安全取消")
         except Exception as e:
-            log.warning(f"合成播放异常: {e}")
+            log.error(f"流式分句广播全局异常: {e}")
 
     async def handle_api_ring(self, request: web.Request) -> web.Response:
         """寻机声光呼叫：向所有设备弹出居中报警弹窗并播报鸣叫语音"""
