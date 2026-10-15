@@ -20,9 +20,12 @@ import logging
 import tempfile
 import sqlite3
 import subprocess
-from typing import Dict, Set, Optional, Any
+import signal
+from typing import Dict, Set, Optional, Any, Tuple, Callable, Awaitable, List
 import aiohttp
 from aiohttp import web, WSMsgType
+import urllib.request
+import urllib.error
 import lark_oapi as lark
 from lark_oapi.api.im.v1 import (
     CreateMessageRequest, CreateMessageRequestBody,
@@ -82,6 +85,67 @@ def clean_text_for_speech(text: str, max_chars: int = 150) -> str:
     s = emoji_pattern.sub('', s)
     s = re.sub(r'\s+', ' ', s).strip()
     return s[:max_chars]
+
+
+class SentenceChunker:
+    """
+    流式切句器：
+    实时接收大模型输出的文本增量 (text_delta)，
+    智能按标点（。！？；，及换行）以及长度阈值进行首句极速切片抢跑与后续平滑分句。
+    """
+    def __init__(self):
+        self.buffer = ""
+        self.is_first_sentence = True
+        self.major_delims = set("。！？!?\n")
+        self.minor_delims = set("，；,;：:")
+
+    def feed(self, delta: str) -> List[str]:
+        if not delta:
+            return []
+        self.buffer += delta
+        sentences = []
+
+        while True:
+            cut_idx = -1
+            cut_len = 0
+
+            for idx, ch in enumerate(self.buffer):
+                if ch in self.major_delims:
+                    if idx >= 2:
+                        cut_idx = idx
+                        cut_len = 1
+                        break
+                elif ch in self.minor_delims:
+                    min_len = 8 if self.is_first_sentence else 14
+                    if idx >= min_len:
+                        cut_idx = idx
+                        cut_len = 1
+                        break
+
+            if cut_idx == -1 and len(self.buffer) >= 28:
+                cut_idx = 25
+                cut_len = 0
+
+            if cut_idx != -1:
+                sentence = self.buffer[:cut_idx + cut_len].strip()
+                self.buffer = self.buffer[cut_idx + cut_len:].lstrip()
+                if sentence:
+                    self.is_first_sentence = False
+                    sentences.append(sentence)
+            else:
+                break
+
+        return sentences
+
+    def flush(self) -> List[str]:
+        sentences = []
+        rem = self.buffer.strip()
+        self.buffer = ""
+        if rem:
+            sentences.append(rem)
+        return sentences
+
+
 DATA_DIR = CONFIG.get("data_dir", os.path.join(SCRIPT_DIR, "data"))
 os.makedirs(DATA_DIR, exist_ok=True)
 PAIRED_FILE = os.path.join(DATA_DIR, "paired_devices.json")
@@ -231,16 +295,41 @@ class WarmEdgeTTSPool:
                 feed_task = asyncio.create_task(feed_ffmpeg())
 
                 chunk_size = 1920
+                interrupted = False
                 while True:
                     if check_interrupted and check_interrupted():
+                        interrupted = True
                         break
                     chunk = await proc.stdout.read(chunk_size)
                     if not chunk:
                         break
                     await on_pcm_chunk(chunk)
 
-                await feed_task
-                await proc.wait()
+                if interrupted:
+                    if not feed_task.done():
+                        feed_task.cancel()
+                    if proc.returncode is None:
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
+                    self._connected = False
+                    if self.ws and not self.ws.closed:
+                        try:
+                            await self.ws.close()
+                        except Exception:
+                            pass
+                    self.ws = None
+                    return False
+
+                try:
+                    await feed_task
+                except Exception:
+                    pass
+                try:
+                    await proc.wait()
+                except Exception:
+                    pass
                 return True
             except Exception as e:
                 log.error(f"[WarmTTSPool] stream_pcm_realtime 异常，重置连接: {e}")
@@ -495,16 +584,21 @@ def build_voice_interaction_card(
     executed_tools: list = None,
     is_completed: bool = False,
     think_seconds: int = 0,
-    user_name: str = "江江"
+    user_name: str = "江江",
+    planned_steps: list = None,
+    current_step_idx: int = 0,
+    active_tool: dict = None
 ) -> dict:
     """
-    构建符合飞书 App 真实原生体验的智能卡片：
-    - 处理中：展现原生思考指示卡片，引用随身语音原文
-    - 完成后：展现真实答复内容与真实执行的系统工具动作记录，不展示僵化清单
+    构建与飞书 App 完全一模一样的任务执行与步骤进度卡片：
+    - 处理中（有规划）：展示与飞书端完全一致的道路清单（已完成打勾✅，当前步骤⏳高亮执行工具，待执行⚪）
+    - 处理中（无规划但有工具）：展示多步骤工具执行清单（✅ 已完成，⏳ 正在执行）
+    - 完成后：展示真实答复内容与真实执行的系统工具动作记录
     """
     now_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
     clean_user_q = user_text[:60] + ("..." if len(user_text) > 60 else "")
     quote_header = f"> **{user_name}**：🎙️ 随身语音：「{clean_user_q}」\n\n"
+    time_hint = f"已运行 {think_seconds}s" if think_seconds > 0 else "请稍候..."
 
     if is_completed:
         header_title = "✨ AI 智能答复"
@@ -527,12 +621,93 @@ def build_voice_interaction_card(
                 tool_lines.append(f"• 🔧 {label}")
             content += f"\n\n---\n**🛠️ 真实工具执行记录 (共调用 {len(executed_tools)} 个系统动作)：**\n" + "\n".join(tool_lines)
 
-        time_hint = f"已耗时 {think_seconds}s" if think_seconds > 0 else "即时响应"
-        footer_text = f"⚡ Powered by Antigravity · {time_hint} | 🕒 {now_str}"
+        footer_text = f"⚡ Powered by Antigravity · 已耗时 {think_seconds}s | 🕒 {now_str}"
+    elif planned_steps:
+        total = len(planned_steps)
+        current_step_idx = max(0, min(current_step_idx, total - 1))
+        curr_step_name = planned_steps[current_step_idx].strip()
+        curr_step_clean = re.sub(r'^[•\-\*\s✅⏳⚪\d\.\、\[\]]+\s*', '', curr_step_name).strip()
+        curr_step_clean = re.sub(r'^(?:正在执行|正在运行|正在|已执行|已运行|已)\s*', '', curr_step_clean).strip()
+
+        header_title = f"🛠️ [{current_step_idx + 1}/{total}] {curr_step_clean}"
+        if len(header_title) > 28:
+            header_title = header_title[:25] + "..."
+        template = "turquoise"
+
+        lines = []
+        for i, raw_step in enumerate(planned_steps):
+            step = raw_step.strip()
+            core = re.sub(r'^[•\-\*\s✅⏳⚪\d\.\、\[\]]+\s*', '', step).strip()
+            core = re.sub(r'^(?:正在执行|正在运行|正在|已执行|已运行|已)\s*', '', core).strip()
+
+            if i < current_step_idx:
+                completed_text = f"已{core}" if not core.startswith("已") else core
+                lines.append(f"• ✅ **{i+1}. {completed_text}**")
+            elif i == current_step_idx:
+                active_text = f"正在{core}" if not core.startswith("正在") else core
+                if active_tool:
+                    act_summary = active_tool.get("summary") or active_tool.get("name") or ""
+                    act_target = active_tool.get("target") or ""
+                    act_desc = f"{act_summary} {act_target}".strip()
+                    lines.append(f"• ⏳ **{i+1}. {active_text}** `({act_desc[:30]})`...")
+                else:
+                    lines.append(f"• ⏳ **{i+1}. {active_text}**...")
+            else:
+                lines.append(f"• ⚪ {i+1}. {core}")
+
+        steps_block = "\n".join(lines)
+        content = (
+            f"{quote_header}"
+            f"**📋 任务规划与执行清单 (第 {current_step_idx + 1}/{total} 步)：**\n\n"
+            f"{steps_block}\n\n"
+            f"*({time_hint}，随身语音指令全速推进中)*"
+        )
+        footer_text = f"⚡ Powered by Antigravity | 🕒 {now_str}"
+    elif executed_tools or active_tool:
+        all_tools = list(executed_tools or [])
+        total_steps = len(all_tools) + (1 if active_tool and active_tool not in all_tools else 0)
+        curr_tool = active_tool or (all_tools[-1] if all_tools else {})
+        tool_act = curr_tool.get("summary") or curr_tool.get("name") or "执行操作"
+
+        header_title = f"🛠️ [{total_steps}] {tool_act}"
+        if len(header_title) > 28:
+            header_title = header_title[:25] + "..."
+        template = "turquoise"
+
+        lines = []
+        # 最多显示最近 4 个已完成步骤
+        history_tools = all_tools[:-1] if active_tool and active_tool in all_tools else all_tools
+        if len(history_tools) > 4:
+            lines.append(f"*(已完成前 {len(history_tools) - 4} 个执行步骤)*")
+            history_tools = history_tools[-4:]
+
+        for item in history_tools:
+            name = item.get("name", "tool")
+            summary = item.get("summary") or name
+            target = item.get("target", "")
+            target_str = f" `({target[:30]})`" if target else ""
+            lines.append(f"• ✅ **已完成: {summary}**{target_str}")
+
+        if active_tool:
+            a_name = active_tool.get("name", "tool")
+            a_summary = active_tool.get("summary") or a_name
+            a_target = active_tool.get("target", "")
+            a_target_str = f" `({a_target[:30]})`" if a_target else ""
+            lines.append(f"• ⏳ **正在执行: {a_summary}**{a_target_str}...")
+        else:
+            lines.append("• ⏳ 正在整理并生成最终回复...")
+
+        steps_block = "\n".join(lines)
+        content = (
+            f"{quote_header}"
+            f"**🤖 任务多步骤执行中 (第 {total_steps} 步)：**\n\n"
+            f"{steps_block}\n\n"
+            f"*({time_hint}，AI 正在运行底层命令或操作文件)*"
+        )
+        footer_text = f"⚡ Powered by Antigravity | 🕒 {now_str}"
     else:
         header_title = "🎙️ 正在处理随身语音指令..."
         template = "turquoise"
-        time_hint = f"已耗时 {think_seconds}s" if think_seconds > 0 else "已运行 1s"
         content = (
             f"{quote_header}"
             f"🧠 **正在思考并执行任务：**\n\n"
@@ -583,7 +758,9 @@ def build_planned_steps_voice_card(
         executed_tools=executed_tools,
         is_completed=is_completed,
         think_seconds=think_seconds,
-        user_name=user_name
+        user_name=user_name,
+        planned_steps=planned_steps,
+        current_step_idx=current_step_idx
     )
 
 
@@ -606,10 +783,71 @@ class GatewayServer:
         self.pending_auth_ws: Dict[str, web.WebSocketResponse] = {}  # mac -> ws
         self.card_msg_ids: Dict[str, str] = {}  # mac -> feishu message_id
         self.active_tts_tasks: Dict[web.WebSocketResponse, asyncio.Task] = {}
+        self.active_ai_procs: Dict[web.WebSocketResponse, asyncio.subprocess.Process] = {}
         
         # 音频流缓存与抢跑 ASR
         self.voice_buffers: Dict[web.WebSocketResponse, bytearray] = {}
         self.asr_pretasks: Dict[web.WebSocketResponse, asyncio.Task] = {}
+        self._last_synced_project: Optional[str] = None
+
+        # 固件 OTA 版本检测与文件分发
+        self.ota_card_msg_ids: Dict[str, str] = {}  # "mac:tag" -> feishu message_id
+        self.firmware_dir = os.path.join(CONFIG.get("data_dir", SCRIPT_DIR), "firmware")
+        os.makedirs(self.firmware_dir, exist_ok=True)
+        self._ignored_ota_file = os.path.join(CONFIG.get("data_dir", SCRIPT_DIR), "ignored_ota.json")
+        self._cached_release = None
+        self._cached_release_time = 0
+        self._last_ota_check_time = 0
+
+    async def abort_active_session(self, ws: web.WebSocketResponse, reason: str = "barge_in"):
+        """
+        【硬件物理打断 Barge-in 深度熔断机制】：
+        当设备长按确认键打断、开始新录音或断开连接时：
+        1. 立即 kill 正在运行的底层 AI 推理子进程组 (agy)，彻底截断 CPU/Token 消耗；
+        2. 取消并中止正在执行的 TTS 与推流协程任务；
+        3. 清理硬件录音积压缓存与 ASR 预热任务；
+        4. 向硬件下发语音结束及待命状态重置帧，恢复硬件为 Ready。
+        """
+        log.info(f"⚡ [深度熔断] 触发会话打断熔断 ({reason}): peer={self.ws_info.get(ws, {}).get('peer')}")
+
+        # 1. 深度终止底层 AI 推理子进程 (agy 进程组)
+        proc = self.active_ai_procs.pop(ws, None)
+        if proc:
+            try:
+                if proc.returncode is None:
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                        log.info(f"⚡ [深度熔断] 已通过 killpg 彻底清除 AI 进程组 (PGID={proc.pid})")
+                    except Exception:
+                        proc.kill()
+            except Exception as e:
+                log.warning(f"终止 AI 子进程组异常: {e}")
+
+        # 2. 取消并中止正在执行的 TTS 与语音处理协程任务
+        tts_task = self.active_tts_tasks.pop(ws, None)
+        if tts_task and not tts_task.done():
+            tts_task.cancel()
+            log.info("⚡ [深度熔断] 已中断正在进行的 TTS 与音频推流任务")
+
+        # 3. 清理录音缓存与 ASR 任务
+        self.voice_buffers.pop(ws, None)
+        asr_task = self.asr_pretasks.pop(ws, None)
+        if asr_task and not asr_task.done():
+            asr_task.cancel()
+
+        # 4. 下发硬件状态重置帧 (voice_start 或 barge_in 时硬件正处于按键主动接管状态，绝不可回送 voice_reply_end、ai_speech_end 或 idle 干扰硬件录音状态)
+        if not ws.closed and reason not in ("voice_start", "barge_in"):
+            try:
+                await ws.send_str(json.dumps({"type": "voice_reply_end"}))
+                await ws.send_str(json.dumps({"type": "ai_speech_end"}))
+                await ws.send_str(json.dumps({
+                    "type": "ai_state",
+                    "state": "idle",
+                    "detail": "Ready"
+                }))
+                log.info("⚡ [深度熔断] 已成功向硬件下发状态重置帧 (ai_state: idle)")
+            except Exception as e:
+                log.warning(f"向硬件下发状态重置异常: {e}")
 
 
     async def start(self):
@@ -618,8 +856,13 @@ class GatewayServer:
         self.app.router.add_get("/ws/passport", self.handle_websocket)
         self.app.router.add_get("/api/status", self.handle_api_status)
         self.app.router.add_get("/api/pair_decision", self.handle_pair_decision)
+        self.app.router.add_get("/api/ota_action", self.handle_ota_action)
+        self.app.router.add_get("/firmware/{tag}/{filename}", self.handle_firmware_download)
         self.app.router.add_get("/api/devices", self.handle_api_devices)
         self.app.router.add_post("/api/devices/remove", self.handle_api_remove_device)
+        self.app.router.add_post("/api/ring", self.handle_api_ring)
+        self.app.router.add_post("/api/voice", self.handle_api_voice)
+        self.app.router.add_post("/api/speak", self.handle_api_speak)
 
         self.runner = web.AppRunner(self.app)
         await self.runner.setup()
@@ -631,6 +874,9 @@ class GatewayServer:
 
         # 异步启动常驻 Edge-TTS 预热会话池，杜绝首句延迟
         asyncio.create_task(tts_pool.ensure_connected())
+
+        # 异步启动与飞书机器人活跃项目的实时双向同步巡检
+        asyncio.create_task(self._project_sync_loop())
 
 
     async def _start_udp_discovery(self):
@@ -669,7 +915,7 @@ class GatewayServer:
 
     async def handle_websocket(self, request: web.Request) -> web.WebSocketResponse:
         """处理设备端 WebSocket 握手、配对认证与双向全双工交互"""
-        ws = web.WebSocketResponse(autoping=True, heartbeat=None)
+        ws = web.WebSocketResponse(autoping=True, heartbeat=15.0)
         await ws.prepare(request)
         peer = request.remote
         log.info(f"硬件客户端发起 WebSocket 连接: {peer}")
@@ -686,9 +932,7 @@ class GatewayServer:
                 elif msg.type == WSMsgType.ERROR:
                     log.error(f"WS 连接异常: {ws.exception()}")
         finally:
-            tts_task = self.active_tts_tasks.pop(ws, None)
-            if tts_task and not tts_task.done():
-                tts_task.cancel()
+            await self.abort_active_session(ws, reason="disconnect")
             mac = self.ws_to_mac.pop(ws, None)
             if mac and self.mac_to_ws.get(mac) == ws:
                 self.mac_to_ws.pop(mac, None)
@@ -702,9 +946,11 @@ class GatewayServer:
         return ws
 
     async def _handle_client_json(self, ws: web.WebSocketResponse, text_data: str, peer: str):
+        log.info(f"📩 收到设备文本消息 [{peer}]: {text_data[:120]}")
         try:
             data = json.loads(text_data)
-        except Exception:
+        except Exception as e:
+            log.warning(f"解析设备 JSON 异常: {e}, 原始内容: {text_data}")
             return
 
         msg_type = data.get("type")
@@ -733,6 +979,17 @@ class GatewayServer:
                     "token": token,
                     "name": CONFIG.get("gateway_name", "Antigravity 飞书控制台")
                 }))
+                cur_name, projects = self.get_available_projects()
+                await ws.send_str(json.dumps({
+                    "type": "project_list",
+                    "current": cur_name,
+                    "projects": projects
+                }))
+                await ws.send_str(json.dumps({
+                    "type": "project_switched",
+                    "project": cur_name,
+                    "status": "connected"
+                }))
                 log.info(f"已授权设备秒级接入成功: {mac}")
                 asyncio.create_task(self.send_feishu_paired_notify(mac, ip, dev_name))
             else:
@@ -753,12 +1010,26 @@ class GatewayServer:
                 self.mac_to_ws[mac] = ws
                 self.ws_info[ws]["mac"] = mac
                 self.ws_info[ws]["approved"] = True
+                self.ws_info[ws]["data"] = data
                 await ws.send_str(json.dumps({
                     "type": "handshake_ack",
                     "status": "connected",
                     "name": CONFIG.get("gateway_name", "Antigravity 飞书控制台"),
                     "version": "1.0.0"
                 }))
+                cur_name, projects = self.get_available_projects()
+                await ws.send_str(json.dumps({
+                    "type": "project_list",
+                    "current": cur_name,
+                    "projects": projects
+                }))
+                await ws.send_str(json.dumps({
+                    "type": "project_switched",
+                    "project": cur_name,
+                    "status": "connected"
+                }))
+                # 开机/握手成功后异步检查最新固件版本并推送飞书卡片
+                asyncio.create_task(self.check_device_ota(ws, mac, data))
             else:
                 await ws.send_str(json.dumps({
                     "type": "handshake_ack",
@@ -766,31 +1037,27 @@ class GatewayServer:
                     "message": "请先发起 pair_request 并在飞书完成配对认证"
                 }))
 
-        # 打断信号 Barge-in (硬件长按 OK 键即刻打断当前播报)
+        # 打断信号 Barge-in (硬件长按 OK 键即刻打断当前播报与推理)
         elif msg_type == "barge_in":
             log.info(f"收到设备打断信号 (Barge-in): MAC={mac}")
-            task = self.active_tts_tasks.pop(ws, None)
-            if task and not task.done():
-                task.cancel()
-                log.info("已成功中断正在进行的 TTS 推流播报")
+            await self.abort_active_session(ws, reason="barge_in")
 
-        # 3. 对讲语音开始
+        # 3. 对讲语音开始 (打断先前正在进行的播报与推理并开辟新录音缓冲)
         elif msg_type == "voice_start":
             log.info(f"收到设备按下录音开始信号: MAC={mac}")
-            task = self.active_tts_tasks.pop(ws, None)
-            if task and not task.done():
-                task.cancel()
-                log.info("录音开始，打断先前仍在推流的播报任务")
+            await self.abort_active_session(ws, reason="voice_start")
             self.voice_buffers[ws] = bytearray()
 
         # 4. 对讲语音结束
         elif msg_type == "voice_end":
             dev_mac = mac or self.ws_to_mac.get(ws, "")
-            log.info(f"收到设备松开录音结束信号: MAC={dev_mac}")
             buf = self.voice_buffers.pop(ws, bytearray())
+            log.info(f"收到设备松开录音结束信号: MAC={dev_mac}, 音频缓冲大小: {len(buf)} 字节")
             if len(buf) > 0:
                 tts_t = asyncio.create_task(self.process_incoming_voice(ws, dev_mac, buf))
                 self.active_tts_tasks[ws] = tts_t
+            else:
+                log.warning("⚠️ 录音缓冲为空 (0 字节)，无法进行语音处理！")
 
         # 5. 心跳 Ping
         elif msg_type == "ping":
@@ -799,33 +1066,7 @@ class GatewayServer:
         # 6. 获取项目列表 (硬件短按 ▲ 键呼出项目切换列表)
         elif msg_type == "project_list":
             log.info(f"收到设备请求项目列表: MAC={mac}")
-            bot_session = self.get_active_bot_session()
-            current_proj = ""
-            projects = []
-            if bot_session:
-                current_proj = bot_session.get("project", "")
-            # 从 sqlite 读取 recent_projects
-            try:
-                db_path = "/home/jiang/github/antigravity-feishu-bot/antigravity_bot.db"
-                if os.path.exists(db_path):
-                    conn = sqlite3.connect(db_path)
-                    c = conn.cursor()
-                    row = c.execute("SELECT data FROM chat_sessions ORDER BY rowid DESC LIMIT 1").fetchone()
-                    conn.close()
-                    if row and row[0]:
-                        s_data = json.loads(row[0])
-                        recents = s_data.get("recent_projects", [])
-                        for p in recents:
-                            p_name = os.path.basename(p.rstrip("/"))
-                            if p_name and p_name not in projects:
-                                projects.append(p_name)
-            except Exception as e:
-                log.warning(f"读取近期项目列表异常: {e}")
-
-            if not projects:
-                projects = ["Letgo", "feishu-bot-plugin", "passport_game", "raspberry", "antigravity-feishu-bot"]
-            cur_name = os.path.basename(current_proj.rstrip("/")) if current_proj else "Letgo"
-
+            cur_name, projects = self.get_available_projects()
             resp = {
                 "type": "project_list",
                 "current": cur_name,
@@ -839,6 +1080,9 @@ class GatewayServer:
             target_proj = data.get("project", "")
             log.info(f"收到设备请求切换项目: {target_proj} (MAC={mac})")
             if target_proj:
+                new_path = f"/home/jiang/github/{target_proj}"
+                cid = None
+                s_data = {}
                 try:
                     db_path = "/home/jiang/github/antigravity-feishu-bot/antigravity_bot.db"
                     if os.path.exists(db_path):
@@ -848,25 +1092,60 @@ class GatewayServer:
                         if row and row[0]:
                             cid = row[0]
                             s_data = json.loads(row[1]) if row[1] else {}
-                            new_path = f"/home/jiang/github/{target_proj}"
+                            ws_root = s_data.get("workspace_root", "/home/jiang/github")
+                            if target_proj.startswith("/") and os.path.isdir(target_proj):
+                                new_path = target_proj
+                            elif os.path.isdir(os.path.join(ws_root, target_proj)):
+                                new_path = os.path.join(ws_root, target_proj)
+                            else:
+                                matched = None
+                                for rp in s_data.get("recent_projects", []):
+                                    if os.path.basename(rp.rstrip("/")) == target_proj:
+                                        matched = rp
+                                        break
+                                new_path = matched if matched else os.path.join(ws_root, target_proj)
+
                             s_data["project"] = new_path
+                            recents = s_data.get("recent_projects", [])
+                            if new_path in recents:
+                                recents.remove(new_path)
+                            recents.insert(0, new_path)
+                            s_data["recent_projects"] = recents[:10]
+
                             c.execute("UPDATE chat_sessions SET data = ? WHERE chat_id = ?", (json.dumps(s_data, ensure_ascii=False), cid))
                             conn.commit()
                             log.info(f"已同步更新飞书机器人工作目录为: {new_path}")
+                            self._last_synced_project = new_path
                         conn.close()
                 except Exception as e:
                     log.error(f"切换项目更新数据库异常: {e}")
 
+                cur_name = os.path.basename(new_path.rstrip("/")) if new_path else target_proj
+                _, projects = self.get_available_projects()
                 await ws.send_str(json.dumps({
                     "type": "project_switched",
-                    "project": target_proj,
+                    "project": cur_name,
                     "status": "success"
                 }))
+                await ws.send_str(json.dumps({
+                    "type": "project_list",
+                    "current": cur_name,
+                    "projects": projects
+                }))
+
+                if cid:
+                    card = self.build_project_switch_card(new_path, s_data)
+                    asyncio.create_task(self.send_feishu_card_to_chat(cid, card))
 
     async def _handle_client_binary(self, ws: web.WebSocketResponse, data: bytes):
         """流式追加设备录音音频分片"""
         if ws in self.voice_buffers:
             self.voice_buffers[ws].extend(data)
+            cur_len = len(self.voice_buffers[ws])
+            if cur_len % 32000 < len(data):
+                log.info(f"🎙️ 正在流式接收音频，当前累积: {cur_len} 字节")
+        else:
+            log.warning(f"⚠️ 收到二进制音频分片 ({len(data)} 字节)，但 ws 不在 voice_buffers 中！")
 
     async def send_feishu_auth_card(self, mac: str, ip: str, name: str):
         """向管理员飞书推送配对审批交互卡片"""
@@ -1006,6 +1285,17 @@ class GatewayServer:
                     "token": token,
                     "name": CONFIG.get("gateway_name", "Antigravity 飞书控制台")
                 }))
+                cur_name, projects = self.get_available_projects()
+                await ws.send_str(json.dumps({
+                    "type": "project_list",
+                    "current": cur_name,
+                    "projects": projects
+                }))
+                await ws.send_str(json.dumps({
+                    "type": "project_switched",
+                    "project": cur_name,
+                    "status": "connected"
+                }))
                 log.info(f"挂起的设备已通过审批并下发 ACK: MAC={mac}")
 
             self._update_feishu_card_status(mac, approved=True)
@@ -1075,6 +1365,381 @@ class GatewayServer:
         except Exception as e:
             log.warning(f"更新飞书审批卡片状态失败: {e}")
 
+    def _load_ignored_ota(self) -> dict:
+        try:
+            if os.path.exists(self._ignored_ota_file):
+                with open(self._ignored_ota_file, "r", encoding="utf-8") as f:
+                    return json.load(f)
+        except Exception as e:
+            log.warning(f"[OTA] 读取已忽略固件版本异常: {e}")
+        return {}
+
+    def _save_ignored_ota(self, data: dict):
+        try:
+            with open(self._ignored_ota_file, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            log.warning(f"[OTA] 保存已忽略固件版本异常: {e}")
+
+    async def get_latest_github_release(self) -> Optional[dict]:
+        """获取 GitHub 最新的固件 Release 发布信息 (带内存缓存 60 秒)"""
+        now = time.time()
+        if self._cached_release and (now - self._cached_release_time < 60):
+            return self._cached_release
+
+        token = CONFIG.get("github_token", "")
+        url = "https://api.github.com/repos/Level6me/Letgo/releases?per_page=1"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "PassportBridge-OTA"
+        }
+
+        loop = asyncio.get_running_loop()
+        def _fetch():
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read().decode())
+                if data and isinstance(data, list):
+                    return data[0]
+                return None
+
+        try:
+            release = await loop.run_in_executor(None, _fetch)
+            if release:
+                self._cached_release = release
+                self._cached_release_time = now
+                return release
+        except Exception as e:
+            log.warning(f"[OTA] 获取 GitHub 最新 Release 失败: {e}")
+        return None
+
+    async def check_device_ota(self, ws: web.WebSocketResponse, mac: str, data: dict):
+        """当设备握手连接时，检查固件版本并向飞书推送更新交互卡片"""
+        if not mac:
+            return
+
+        # 延迟 1 秒，等待握手与看板同步稳定完成
+        await asyncio.sleep(1.0)
+
+        release = await self.get_latest_github_release()
+        if not release:
+            log.info(f"[OTA] 未能获取到最新 Release 信息，跳过检测: MAC={mac}")
+            return
+
+        latest_tag = release.get("tag_name", "").strip()
+        if not latest_tag:
+            return
+
+        dev_version = data.get("version", "未知版本")
+        fw_tag = data.get("firmware_tag", "")
+        compile_date = data.get("compile_date", "")
+        compile_time = data.get("compile_time", "")
+
+        # 1. 检查是否已经是该版本 (需双重核验实际内核编译日期，防止 NVS fw_tag 提前写入后实际 OTA 失败或回滚导致的假升级现象)
+        is_up_to_date = (fw_tag == latest_tag or (dev_version and dev_version == latest_tag))
+        if is_up_to_date and "Oct 12" in compile_date:
+            log.warning(f"[OTA] 设备上报 tag 虽然为 {fw_tag}，但真实内核编译日期滞后 ({compile_date})，判定为未真正刷入，允许重新推送升级: MAC={mac}")
+            is_up_to_date = False
+
+        if is_up_to_date:
+            log.info(f"[OTA] 设备已是最新固件 ({latest_tag})，无需提醒: MAC={mac}")
+            return
+
+        # 2. 检查是否已经向飞书推送过该版本的卡片（杜绝重复刷屏）
+        card_key = f"{mac}:{latest_tag}"
+        if card_key in self.ota_card_msg_ids:
+            return
+
+        # 3. 检查用户是否在此设备上忽略过此版本
+        ignored_map = self._load_ignored_ota()
+        if latest_tag in ignored_map.get(mac, []):
+            log.info(f"[OTA] 固件版本 {latest_tag} 已被用户设置为忽略: MAC={mac}")
+            return
+
+        # 3. 推送交互卡片到飞书
+        client = get_lark_client()
+        admin_chat_id = CONFIG.get("admin_chat_id")
+        if not client or not admin_chat_id:
+            log.warning("[OTA] 缺少 Lark Client 或 admin_chat_id，无法推送固件更新卡片")
+            return
+
+        created_at = release.get("created_at", "")
+        if created_at:
+            try:
+                t_obj = time.strptime(created_at, "%Y-%m-%dT%H:%M:%SZ")
+                t_local = time.localtime(time.mktime(t_obj) + 8 * 3600)
+                created_str = time.strftime("%Y-%m-%d %H:%M:%S", t_local)
+            except Exception:
+                created_str = created_at
+        else:
+            created_str = "未知时间"
+
+        body_snippet = release.get("body", "").strip()
+        if not body_snippet:
+            body_snippet = "FoloToy AI Passport 固件更新包"
+        else:
+            body_snippet = body_snippet[:150] + ("..." if len(body_snippet) > 150 else "")
+
+        server_ip = CONFIG.get("external_ip") or "10.0.0.2"
+        upgrade_url = f"http://{server_ip}:{self.port}/api/ota_action?action=upgrade&mac={mac}&tag={latest_tag}"
+        ignore_url = f"http://{server_ip}:{self.port}/api/ota_action?action=ignore&mac={mac}&tag={latest_tag}"
+
+        curr_info = f"`{dev_version}`"
+        if compile_date or compile_time:
+            curr_info += f" ({compile_date} {compile_time})"
+
+        card = {
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "title": {"tag": "plain_text", "content": "🚀 检测到 AI Passport 固件新版本"},
+                "template": "blue"
+            },
+            "elements": [
+                {
+                    "tag": "div",
+                    "text": {
+                        "tag": "lark_md",
+                        "content": (
+                            f"**📟 设备开机连接就绪，检测到云端有新编译固件：**\n"
+                            f"• **设备名称**：`FoloToy AI Passport`\n"
+                            f"• **硬件 MAC**：`{mac}`\n"
+                            f"• **当前固件版本**：{curr_info}\n"
+                            f"• **最新固件版本**：**`{latest_tag}`**\n"
+                            f"• **构建发布时间**：{created_str}\n"
+                            f"• **更新摘要**：{body_snippet}\n\n"
+                            f"点击下方按钮可向设备直接推送 OTA 无线升级："
+                        )
+                    }
+                },
+                {"tag": "hr"},
+                {
+                    "tag": "action",
+                    "actions": [
+                        {
+                            "tag": "button",
+                            "text": {"tag": "plain_text", "content": "🚀 推送更新"},
+                            "type": "primary",
+                            "url": upgrade_url
+                        },
+                        {
+                            "tag": "button",
+                            "text": {"tag": "plain_text", "content": "⚪ 忽略本次更新"},
+                            "type": "default",
+                            "url": ignore_url
+                        }
+                    ]
+                }
+            ]
+        }
+
+        try:
+            req = CreateMessageRequest.builder() \
+                .receive_id_type("chat_id") \
+                .request_body(CreateMessageRequestBody.builder()
+                    .receive_id(admin_chat_id)
+                    .msg_type("interactive")
+                    .content(json.dumps(card))
+                    .build()) \
+                .build()
+            loop = asyncio.get_running_loop()
+            resp = await loop.run_in_executor(None, lambda: client.im.v1.message.create(req))
+            if resp.code == 0:
+                msg_id = json.loads(resp.raw.content).get("data", {}).get("message_id")
+                self.ota_card_msg_ids[f"{mac}:{latest_tag}"] = msg_id
+                log.info(f"[OTA] 已成功向飞书发送固件升级卡片 (MsgID={msg_id}, Tag={latest_tag})")
+            else:
+                log.error(f"[OTA] 发送飞书固件升级卡片失败: {resp.msg}")
+        except Exception as e:
+            log.error(f"[OTA] 推送飞书固件升级卡片异常: {e}")
+
+    async def handle_ota_action(self, request: web.Request) -> web.Response:
+        """处理飞书卡片上的【推送更新】与【忽略本次更新】操作"""
+        action = request.query.get("action", "").lower().strip()
+        mac = request.query.get("mac", "").lower().strip()
+        tag = request.query.get("tag", "").strip()
+
+        if not mac or not tag:
+            return web.Response(text="缺少必要参数 (mac, tag)", status=400)
+
+        card_key = f"{mac}:{tag}"
+        msg_id = self.ota_card_msg_ids.get(card_key)
+        client = get_lark_client()
+
+        if action == "ignore":
+            ignored_map = self._load_ignored_ota()
+            mac_ignored = set(ignored_map.get(mac, []))
+            mac_ignored.add(tag)
+            ignored_map[mac] = list(mac_ignored)
+            self._save_ignored_ota(ignored_map)
+            log.info(f"[OTA] 用户已忽略固件版本 {tag}: MAC={mac}")
+
+            if msg_id and client:
+                now_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+                patch_card = {
+                    "config": {"wide_screen_mode": True},
+                    "header": {
+                        "title": {"tag": "plain_text", "content": "⚪ AI Passport 固件更新已忽略"},
+                        "template": "grey"
+                    },
+                    "elements": [
+                        {
+                            "tag": "div",
+                            "text": {
+                                "tag": "lark_md",
+                                "content": (
+                                    f"• **硬件 MAC**：`{mac}`\n"
+                                    f"• **版本号**：`{tag}`\n"
+                                    f"• **处理结果**：⚪ **已忽略本次更新**\n"
+                                    f"• 该版本后续开机连接将不再向飞书重复推送卡片提醒。\n"
+                                    f"• **处理时间**：{now_str}"
+                                )
+                            }
+                        }
+                    ]
+                }
+                try:
+                    req = PatchMessageRequest.builder() \
+                        .message_id(msg_id) \
+                        .request_body(PatchMessageRequestBody.builder().content(json.dumps(patch_card)).build()) \
+                        .build()
+                    client.im.v1.message.patch(req)
+                except Exception as e:
+                    log.warning(f"[OTA] 更新飞书忽略卡片失败: {e}")
+
+            html = f"""
+            <html><head><meta charset="utf-8"><title>已忽略本次更新</title></head>
+            <body style="font-family:sans-serif;text-align:center;padding:50px;">
+                <h1 style="color:#86909C;">⚪ 已忽略固件更新</h1>
+                <p>设备 (MAC: {mac}) 后续开机连接将不再重复提醒版本 <b>{tag}</b>。</p>
+            </body></html>
+            """
+            return web.Response(text=html, content_type="text/html")
+
+        elif action == "upgrade":
+            ws = self.mac_to_ws.get(mac)
+            if not ws or ws.closed:
+                return web.Response(text="❌ 设备当前未连接，无法下发 OTA 升级指令，请确保设备在线后重试。", status=400)
+
+            tag_dir = os.path.join(self.firmware_dir, tag)
+            os.makedirs(tag_dir, exist_ok=True)
+            ota_file = os.path.join(tag_dir, "ota.bin")
+
+            if not os.path.exists(ota_file):
+                log.info(f"[OTA] 本地尚未缓存 {tag} 固件，开始从 GitHub Release 获取...")
+                release = await self.get_latest_github_release()
+                download_url = None
+                is_full_bin = False
+                for asset in (release.get("assets", []) if release else []):
+                    if asset.get("name") in ["FoloToy-AI-Passport-ota.bin", "xiao_zhi.bin"]:
+                        download_url = asset.get("browser_download_url")
+                        is_full_bin = False
+                        break
+                    elif asset.get("name") == "FoloToy-AI-Passport-full.bin":
+                        download_url = asset.get("browser_download_url")
+                        is_full_bin = True
+
+                if not download_url:
+                    return web.Response(text=f"无法从 Release {tag} 中获取固件下载地址", status=500)
+
+                token = CONFIG.get("github_token", "")
+                tmp_file = os.path.join(tag_dir, "download.bin")
+                loop = asyncio.get_running_loop()
+                def _dl():
+                    req = urllib.request.Request(download_url, headers={
+                        "Authorization": f"Bearer {token}",
+                        "Accept": "application/octet-stream",
+                        "User-Agent": "PassportBridge-OTA"
+                    })
+                    with urllib.request.urlopen(req) as resp, open(tmp_file, "wb") as f_out:
+                        f_out.write(resp.read())
+
+                await loop.run_in_executor(None, _dl)
+
+                if is_full_bin:
+                    with open(tmp_file, "rb") as sf:
+                        sf.seek(0x1A0000)
+                        ota_bytes = sf.read()
+                    with open(ota_file, "wb") as df:
+                        df.write(ota_bytes)
+                    try:
+                        os.remove(tmp_file)
+                    except Exception:
+                        pass
+                else:
+                    os.rename(tmp_file, ota_file)
+                log.info(f"[OTA] 固件准备完毕: {ota_file} ({os.path.getsize(ota_file)} 字节)")
+
+            server_ip = CONFIG.get("external_ip") or "10.0.0.2"
+            firmware_url = f"http://{server_ip}:{self.port}/firmware/{tag}/ota.bin"
+
+            ota_cmd = {
+                "type": "ota_upgrade",
+                "url": firmware_url,
+                "version": tag
+            }
+            await ws.send_str(json.dumps(ota_cmd))
+            log.info(f"[OTA] 成功向设备下发 OTA 升级指令: url={firmware_url}, version={tag}")
+
+            if msg_id and client:
+                now_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+                patch_card = {
+                    "config": {"wide_screen_mode": True},
+                    "header": {
+                        "title": {"tag": "plain_text", "content": "🚀 AI Passport 固件更新进行中"},
+                        "template": "turquoise"
+                    },
+                    "elements": [
+                        {
+                            "tag": "div",
+                            "text": {
+                                "tag": "lark_md",
+                                "content": (
+                                    f"• **硬件 MAC**：`{mac}`\n"
+                                    f"• **目标版本**：**`{tag}`**\n"
+                                    f"• **升级状态**：✅ **已成功下发 OTA 指令！**\n"
+                                    f"• 设备正在高速下载固件并写入 Flash。\n"
+                                    f"• 屏幕正在显示百分比进度条，写入完成后将自动重启生效。\n"
+                                    f"• **推送时间**：{now_str}"
+                                )
+                            }
+                        }
+                    ]
+                }
+                try:
+                    req = PatchMessageRequest.builder() \
+                        .message_id(msg_id) \
+                        .request_body(PatchMessageRequestBody.builder().content(json.dumps(patch_card)).build()) \
+                        .build()
+                    client.im.v1.message.patch(req)
+                except Exception as e:
+                    log.warning(f"[OTA] 更新飞书升级进行中卡片失败: {e}")
+
+            html = f"""
+            <html><head><meta charset="utf-8"><title>固件升级已推送</title></head>
+            <body style="font-family:sans-serif;text-align:center;padding:50px;">
+                <h1 style="color:#00B96B;">🚀 固件 OTA 升级指令已下发！</h1>
+                <p>设备 (MAC: {mac}) 已收到升级指令并开始从局域网下载 <b>{tag}</b>。</p>
+                <p>请留意设备屏幕上的百分比进度，下载写入完毕后将自动重启完成升级。</p>
+            </body></html>
+            """
+            return web.Response(text=html, content_type="text/html")
+
+        return web.Response(text="未知操作", status=400)
+
+    async def handle_firmware_download(self, request: web.Request) -> web.StreamResponse:
+        """为设备提供 OTA 固件静态下载服务"""
+        tag = request.match_info.get("tag")
+        filename = request.match_info.get("filename")
+        if not tag or not filename:
+            return web.Response(text="参数错误", status=400)
+
+        filepath = os.path.join(self.firmware_dir, tag, filename)
+        if not os.path.exists(filepath):
+            return web.Response(text="固件文件不存在", status=404)
+
+        return web.FileResponse(filepath)
+
     async def transcribe_voice(self, wav_path: str) -> str:
         """使用 SpeechRecognition 进行本地/在线语音识别"""
         loop = asyncio.get_running_loop()
@@ -1130,11 +1795,239 @@ class GatewayServer:
                     "conversation": session_data.get("conversation", ""),
                     "project": session_data.get("project", ""),
                     "model": session_data.get("model", "gemini-3.8-flash-low"),
-                    "memory_context": session_data.get("memory_context", "")
+                    "memory_context": session_data.get("memory_context", ""),
+                    "workspace_root": session_data.get("workspace_root", "/home/jiang/github"),
+                    "recent_projects": session_data.get("recent_projects", []),
+                    "ignored_projects": session_data.get("ignored_projects", []),
+                    "raw_session_data": session_data
                 }
         except Exception as e:
             log.error(f"读取飞书机器人活跃会话失败: {e}")
         return None
+
+    def get_available_projects(self) -> tuple[str, list[str]]:
+        """获取当前活跃项目及工作区所有可用项目列表 (当前项置顶，近期项目优先，并按字母排序)"""
+        bot_session = self.get_active_bot_session()
+        current_proj = bot_session.get("project", "") if bot_session else ""
+        cur_name = os.path.basename(current_proj.rstrip("/")) if current_proj else "Letgo"
+
+        projects = []
+        if cur_name:
+            projects.append(cur_name)
+
+        ws_root = "/home/jiang/github"
+        recents = []
+        ignored = []
+        if bot_session:
+            ws_root = bot_session.get("workspace_root", "/home/jiang/github")
+            recents = bot_session.get("recent_projects", [])
+            ignored = bot_session.get("ignored_projects", [])
+
+        # 优先追加近期活跃项目
+        for p in recents:
+            p_name = os.path.basename(p.rstrip("/"))
+            if p_name and p_name not in projects and p not in ignored:
+                projects.append(p_name)
+
+        # 扫描工作区目录补充其余工程
+        if os.path.exists(ws_root):
+            try:
+                for n in sorted(os.listdir(ws_root)):
+                    if n.startswith(".") or n in ["venv", "downloads"]:
+                        continue
+                    fp = os.path.join(ws_root, n)
+                    if fp in ignored:
+                        continue
+                    if os.path.isdir(fp) and n not in projects:
+                        projects.append(n)
+            except Exception as e:
+                log.warning(f"扫描工作区项目目录失败: {e}")
+
+        if not projects:
+            projects = ["Letgo", "passport_game", "feishu-bot-plugin", "antigravity-feishu-bot"]
+
+        return cur_name, projects[:12]
+
+    def get_context_stats_fast(self, session_data: dict = None) -> dict:
+        """快速估算当前会话上下文使用情况"""
+        model_name = session_data.get("model", "gemini-3.8-flash-high") if session_data else "gemini-3.8-flash-high"
+        max_tokens = 1000000
+        if "claude" in model_name.lower():
+            max_tokens = 200000
+        elif any(k in model_name.lower() for k in ["gpt-4", "gpt4", "gpt"]):
+            max_tokens = 128000
+
+        conv_id = session_data.get("conversation") if session_data else ""
+        transcript_path = ""
+        if conv_id:
+            p = f"/home/jiang/.gemini/antigravity-cli/brain/{conv_id}/.system_generated/logs/transcript.jsonl"
+            if os.path.exists(p):
+                transcript_path = p
+
+        total_tokens = 0
+        if transcript_path and os.path.exists(transcript_path):
+            try:
+                def est_tok(txt):
+                    if not txt:
+                        return 0
+                    if not isinstance(txt, str):
+                        txt = json.dumps(txt, ensure_ascii=False)
+                    cjk = sum(1 for c in txt if '\u4e00' <= c <= '\u9fff')
+                    return int(cjk * 1.5 + (len(txt) - cjk) / 3.8)
+
+                with open(transcript_path, "r", encoding="utf-8", errors="ignore") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            d = json.loads(line)
+                            total_tokens += est_tok(d.get("content", "")) + est_tok(d.get("thinking", "")) + est_tok(d.get("tool_calls", ""))
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+        if total_tokens == 0:
+            total_tokens = 2500
+        free_tokens = max(0, max_tokens - total_tokens)
+        free_pct = max(0.0, 100.0 - (total_tokens / max_tokens * 100.0))
+        return {
+            "total_tokens": total_tokens,
+            "free_tokens": free_tokens,
+            "max_tokens": max_tokens,
+            "free_pct": free_pct
+        }
+
+    def build_project_switch_card(self, target_path: str, session_data: dict) -> dict:
+        """构建与飞书 App /project 面板完全一致的响应通知卡片"""
+        project_name_only = os.path.basename(target_path) if target_path else "默认"
+        current_model = session_data.get("model", "Default") if session_data else "Default"
+        success_text = (
+            f"📂 **工作区项目切换成功！**\n\n"
+            f"当前已将活跃目录设定为：\n`{target_path}`"
+        )
+        elements = [{
+            "tag": "markdown",
+            "content": success_text
+        }]
+
+        stats = self.get_context_stats_fast(session_data)
+        def format_k(num):
+            if num >= 1000000:
+                return f"{num / 1000000:.1f}M"
+            elif num >= 1000:
+                return f"{num / 1000:.1f}K"
+            return str(num)
+
+        raw_free_pct = stats.get("free_pct", 100.0)
+        total_tokens = stats.get("total_tokens", 0)
+        free_tokens = stats.get("free_tokens", 1000000)
+        max_tokens = stats.get("max_tokens", 1000000)
+
+        if total_tokens == 0 or raw_free_pct >= 100.0:
+            free_pct_str = "100.0"
+        elif raw_free_pct >= 99.9:
+            free_pct_str = f"{raw_free_pct:.2f}" if raw_free_pct < 99.99 else "99.99"
+        else:
+            free_pct_str = f"{raw_free_pct:.1f}"
+
+        context_str = f"🧠 上下文剩余: {free_pct_str}% ({format_k(free_tokens)}/{format_k(max_tokens)})"
+        meta_parts = [f"🤖 模型: {current_model}", f"🗂️ 项目: {project_name_only}", context_str]
+        elements.append({
+            "tag": "markdown",
+            "content": f"<font color='grey'>{' | '.join(meta_parts)}</font>"
+        })
+
+        now_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+        elements.append({
+            "tag": "note",
+            "elements": [
+                {
+                    "tag": "plain_text",
+                    "content": f"⚡ Powered by Antigravity | 🕒 {now_str}"
+                }
+            ]
+        })
+
+        return {
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "template": "blue",
+                "title": {"content": "✨ AI 回复", "tag": "plain_text"}
+            },
+            "elements": elements
+        }
+
+    async def send_feishu_card_to_chat(self, chat_id: str, card: dict):
+        """向指定的飞书会话推送交互式卡片"""
+        client = get_lark_client()
+        if not client:
+            log.warning("Lark client 不可用，无法发送项目切换卡片")
+            return
+        try:
+            req = CreateMessageRequest.builder() \
+                .receive_id_type("chat_id") \
+                .request_body(CreateMessageRequestBody.builder() \
+                    .receive_id(chat_id) \
+                    .msg_type("interactive") \
+                    .content(json.dumps(card)) \
+                    .build()) \
+                .build()
+            loop = asyncio.get_running_loop()
+            resp = await loop.run_in_executor(None, lambda: client.im.v1.message.create(req))
+            if resp.code == 0:
+                log.info(f"已成功向飞书会话 ({chat_id}) 推送项目切换通知卡片")
+            else:
+                log.error(f"推送项目切换卡片失败: code={resp.code}, msg={resp.msg}")
+        except Exception as e:
+            log.error(f"推送飞书卡片异常: {e}")
+
+    async def _project_sync_loop(self):
+        """定期巡检飞书机器人数据库中的活跃项目变动，并在发生切换时主动广播同步至硬件"""
+        while True:
+            try:
+                await asyncio.sleep(1.0)
+                bot_session = self.get_active_bot_session()
+                if not bot_session:
+                    continue
+                cur_proj = bot_session.get("project", "")
+                if not cur_proj:
+                    continue
+                if self._last_synced_project is None:
+                    self._last_synced_project = cur_proj
+                    continue
+                if cur_proj != self._last_synced_project:
+                    log.info(f"[ProjectSync] 检测到飞书控制台切换项目: {self._last_synced_project} -> {cur_proj}")
+                    self._last_synced_project = cur_proj
+                    cur_name, projects = self.get_available_projects()
+                    switched_msg = json.dumps({
+                        "type": "project_switched",
+                        "project": cur_name,
+                        "status": "success"
+                    })
+                    list_msg = json.dumps({
+                        "type": "project_list",
+                        "current": cur_name,
+                        "projects": projects
+                    })
+                    for ws in list(self.active_websockets):
+                        try:
+                            await ws.send_str(switched_msg)
+                            await ws.send_str(list_msg)
+                        except Exception:
+                            pass
+
+                # 定期巡检已连接设备的固件升级 (每300秒)
+                now_ts = time.time()
+                if now_ts - self._last_ota_check_time > 300:
+                    self._last_ota_check_time = now_ts
+                    for m, w in list(self.mac_to_ws.items()):
+                        if not w.closed:
+                            d = self.ws_info.get(w, {}).get("data", {})
+                            asyncio.create_task(self.check_device_ota(w, m, d))
+            except Exception as e:
+                log.warning(f"项目同步巡检异常: {e}")
 
     def update_bot_session_summary(self, chat_id: str, user_text: str, reply_text: str):
         """将随身设备本轮问答同步写入飞书机器人的会话摘要，确保飞书App下一次输入无缝接续"""
@@ -1314,7 +2207,17 @@ class GatewayServer:
             log.warning(f"解析 transcript 记录异常: {e}")
         return tools
 
-    async def generate_ai_reply(self, user_query: str, mac: str = "", feishu_msg_id: str = "", planned_steps: list = None, duration_sec: float = 0.0) -> tuple:
+    async def generate_ai_reply(
+        self,
+        user_query: str,
+        mac: str = "",
+        feishu_msg_id: str = "",
+        feishu_msg_id_fut: Optional[asyncio.Future] = None,
+        planned_steps: list = None,
+        duration_sec: float = 0.0,
+        on_sentence: Optional[Callable[[str], Awaitable[None]]] = None,
+        ws: Optional[web.WebSocketResponse] = None
+    ) -> tuple:
         """调用 Antigravity 针对用户语音提问生成口语化分析回复，深度注入飞书App当前会话上下文并具备全量工具执行能力"""
         if not user_query:
             return "我没有听清您的说话内容，请长按确认键重新对我说话。", []
@@ -1333,49 +2236,71 @@ class GatewayServer:
                     self.update_bot_session_summary(chat_id, f"🎙️ [随身设备语音] {user_query}", reply_text)
                 if conv_id:
                     self.append_turn_to_transcript(conv_id, user_query, reply_text)
+                if on_sentence:
+                    await on_sentence(reply_text)
                 return reply_text, executed_tools
         except Exception as e:
             log.warning(f"智能家居直通执行异常，回退至大模型调度: {e}")
-
-        recent_context = self.extract_recent_transcript_context(conv_id)
-        context_block = f"【飞书App当前会话最近讨论记录】\n{recent_context}\n\n" if recent_context else ""
-
-        # 检查最新编译产物状态
-        fw_exists = os.path.exists("/home/jiang/github/Letgo/fw-37423795163/FoloToy-AI-Passport-full.bin")
-        fw_status_note = "【系统环境实时状态】：当前新固件（Run ID: 37423795163）已构建编译完成，完整固件包已下载到本地！" if fw_exists else "【系统环境实时状态】：当前固件正在编译或准备中。"
 
         project_dir = bot_session.get("project", "") if bot_session else ""
         if not project_dir or not os.path.isdir(project_dir):
             project_dir = "/home/jiang/github/Letgo"
 
+        recent_context = self.extract_recent_transcript_context(conv_id)
+        context_block = f"【飞书App当前会话最近讨论记录】\n{recent_context}\n\n" if recent_context else ""
+
+        # 动态扫描最新编译产物状态
+        fw_status_note = "【系统环境实时状态】：当前固件正在编译或准备中。"
+        fw_out_dir = os.path.join(project_dir, "firmware_output")
+        if os.path.exists(fw_out_dir):
+            try:
+                runs = [d for d in os.listdir(fw_out_dir) if d.startswith("fw-") and os.path.isdir(os.path.join(fw_out_dir, d))]
+                if runs:
+                    runs.sort(key=lambda d: os.path.getmtime(os.path.join(fw_out_dir, d)), reverse=True)
+                    latest_run = runs[0]
+                    bin_path = os.path.join(fw_out_dir, latest_run, "FoloToy-AI-Passport-full.bin")
+                    if os.path.exists(bin_path):
+                        sz_mb = round(os.path.getsize(bin_path) / (1024 * 1024), 2)
+                        fw_status_note = f"【系统环境实时状态】：当前最新固件（{latest_run}，{sz_mb}MB）已构建编译完成，完整固件包已下载到本地！"
+            except Exception:
+                pass
+
         prompt = (
             f"[这是来自用户随身硬件对讲设备 FoloToy AI Passport 的即时语音输入 (MAC: {mac})]\n"
             f"重要原则：用户使用随身硬件对讲提问与在飞书App提问完全等价，拥有最高优先级与完全同等的Agent会话流水线能力！\n"
             f"用户在设备上长按提问：「{user_query}」\n\n"
-            f"【用户核心准则】：\n"
-            f"1. 如果用户发出的是操作、执行、推送、构建、测试等命令（如“把当前项目的最新代码推送到github”），你必须自主调用工具执行完成，绝对严禁推诿让用户手动操作！\n"
-            f"2. 如果用户发出的是智能家居控制指令（如开灯/关灯/查设备/开关空调/开电脑等），系统已提供本地极速控制工具 ha-ctl（在PATH中），你可以直接在命令行运行（例如 ha-ctl find 客厅 查找设备，ha-ctl turn_on 开启，ha-ctl turn_off 关闭，ha-ctl list 列出所有设备）。请优先使用 ha-ctl 快速完成控制，切勿在容器内盲目探索！\n"
-            f"3. 真实性原则：严禁在未成功执行操作时谎称已完成！如果设备离线或遇到错误，如实告知用户当前设备状态与错误原因。\n"
-            f"4. 注意隐私保护，严禁在任何地方明文暴露 GitHub Token 或个人凭证。\n\n"
+            f"【用户核心准则与全量工具执行权限】：\n"
+            f"1. 你拥有当前工程（项目目录：{project_dir}）的全部工具执行权限（包括运行命令 run_command、查看/搜索/修改代码 view_file/replace_file_content/write_to_file、Git操作等）。\n"
+            f"2. 当用户发出的是操作、执行、排查问题、检查固件、定位Bug、推送代码、构建测试等任何工程命令时，你必须立即自主调用工具链进行真实排查与执行，绝对严禁推诿、绝对严禁让用户手动操作、绝对严禁在未成功执行时谎称已完成！\n"
+            f"3. 【任务规划强制规范】：只要判断当前任务需要调用工具执行操作（读写代码、运行终端命令、多步排错等），必须在回复最开始输出一行任务规划：\n"
+            f"[TASK_PLAN] 步骤1名称 | 步骤2名称 | 步骤3名称 [/TASK_PLAN]\n"
+            f"规划精炼（3~4步为宜），飞书界面会自动识别并为用户实时渲染动态步骤进度清单！\n"
+            f"4. 如果用户发出的是智能家居控制指令（如开灯/关灯/查设备/开关空调/开电脑等），系统已提供本地极速控制工具 ha-ctl（在PATH中），你可以直接在命令行运行（例如 ha-ctl find 客厅 查找设备，ha-ctl turn_on 开启，ha-ctl turn_off 关闭，ha-ctl list 列出所有设备）。请优先使用 ha-ctl 快速完成控制，切勿在容器内盲目探索！\n"
+            f"5. 注意隐私保护，严禁在任何地方明文暴露 GitHub Token 或个人凭证。\n\n"
             f"{fw_status_note}\n\n"
             f"{context_block}"
             f"【核心回答指令】\n"
-            f"请完全基于上方飞书App当前会话的最新讨论记录与实时环境状态，对用户在随身设备上的提问做出极速、直接、精准的口语化回答。\n"
-            f"重点要求：第一句话直接给出核心结论或操作结果，严禁寒暄铺垫，篇幅严格控制在20至50字以内，极其适合语音播报；严禁输出Markdown标题、加粗符号、代码块、列表符号或表情符号。"
+            f"如果用户指令需要排查或执行操作，先调用工具完成操作，然后再生成播报文本。\n"
+            f"最终播报文本要求：第一句话直接给出核心结论或操作结果，篇幅控制在20至50字以内，极简口语化，适合硬件喇叭朗读；严禁输出Markdown标题、加粗符号、代码块、列表符号或表情符号。"
         )
 
         agy_bin = CONFIG.get("agy_bin", "/home/jiang/.local/bin/agy")
-        model = CONFIG.get("ai_model", "gemini-3.8-flash-low")
-        effort = CONFIG.get("ai_effort", "low")
+        raw_model = (bot_session.get("model") if bot_session else "") or "gemini-3.8-flash-medium"
 
         cmd = [
             agy_bin,
             "-p", prompt,
-            "--model", model,
-            "--effort", effort,
-            "--print-timeout", "60s"
+            "--model", raw_model,
+            "--dangerously-skip-permissions",
+            "--output-format", "stream-json",
+            "--print-timeout", "300s"
         ]
 
+        # 仅当模型名称未自带 -low/-medium/-high 等固定 effort 后缀时，才附加 --effort，杜绝 agy 参数冲突报错
+        if not any(raw_model.endswith(f"-{e}") for e in ["low", "medium", "high", "xhigh", "max"]):
+            eff = (bot_session.get("effort") if bot_session else "") or "medium"
+            if eff:
+                cmd.extend(["--effort", eff])
 
         # 挂载工作区目录，打通全量 Agent 工具执行权限
         if project_dir and os.path.isdir(project_dir):
@@ -1420,6 +2345,51 @@ class GatewayServer:
 
         monitor_task = asyncio.create_task(_monitor_loop())
 
+        chunker = SentenceChunker()
+        accumulated_deltas = []
+        final_result_response = ""
+        emitted_sentences = 0
+        proc = None
+
+        current_step_idx = 0
+        planned_steps = list(planned_steps or [])
+        last_patch_time = 0.0
+
+        async def maybe_patch_card(active_tool=None, force=False):
+            nonlocal last_patch_time, current_step_idx
+            now_t = time.time()
+            if not force and now_t - last_patch_time < 0.25 and active_tool is None:
+                return
+
+            mid = feishu_msg_id
+            if not mid and feishu_msg_id_fut and feishu_msg_id_fut.done():
+                mid = feishu_msg_id_fut.result()
+
+            if not mid:
+                return
+
+            last_patch_time = now_t
+            card = build_voice_interaction_card(
+                user_text=user_query,
+                executed_tools=executed_tools,
+                is_completed=False,
+                think_seconds=int(now_t - start_time),
+                planned_steps=planned_steps,
+                current_step_idx=current_step_idx,
+                active_tool=active_tool
+            )
+            try:
+                client = get_lark_client()
+                if client:
+                    req = PatchMessageRequest.builder() \
+                        .message_id(mid) \
+                        .request_body(PatchMessageRequestBody.builder().content(json.dumps(card)).build()) \
+                        .build()
+                    loop = asyncio.get_running_loop()
+                    await loop.run_in_executor(None, lambda: client.im.v1.message.patch(req))
+            except Exception as e:
+                log.warning(f"实时更新飞书步骤卡片异常: {e}")
+
         try:
             # 彻底清理环境变量，阻断所有会话锁和嵌套干扰
             custom_env = os.environ.copy()
@@ -1427,23 +2397,128 @@ class GatewayServer:
                 if any(x in k.lower() for x in ["antigravity", "conversation", "trajectory", "agentapi", "gemini_cli"]):
                     custom_env.pop(k, None)
 
-            loop = asyncio.get_running_loop()
-            def _execute_subp():
-                import subprocess
-                return subprocess.run(cmd, env=custom_env, capture_output=True, text=True, timeout=120.0)
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                cwd=project_dir,
+                env=custom_env,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                start_new_session=True
+            )
+            if ws:
+                self.active_ai_procs[ws] = proc
 
-            subp_res = await loop.run_in_executor(None, _execute_subp)
-            output = (subp_res.stdout or "").strip()
-            stderr_out = (subp_res.stderr or "").strip()
-            log.info(f"agy 执行完毕 (RC={subp_res.returncode}, stdout长度={len(output)}, stderr长度={len(stderr_out)})")
-            if subp_res.returncode != 0 and stderr_out:
+            async def read_stream():
+                nonlocal final_result_response, emitted_sentences, current_step_idx, planned_steps
+                while True:
+                    line = await proc.stdout.readline()
+                    if not line:
+                        break
+                    line_str = line.decode("utf-8", errors="ignore").strip()
+                    if not line_str:
+                        continue
+                    try:
+                        evt = json.loads(line_str)
+                        evt_name = evt.get("event")
+                        if evt_name == "step_update":
+                            su = evt.get("step_update", {})
+                            st = su.get("step_type")
+                            delta = su.get("text_delta", "")
+                            if delta and st == "agent_response":
+                                accumulated_deltas.append(delta)
+                                cur_acc_text = "".join(accumulated_deltas)
+                                if "[TASK_PLAN]" in cur_acc_text and "[/TASK_PLAN]" in cur_acc_text:
+                                    m_plan = re.search(r"\[TASK_PLAN\](.*?)\[/TASK_PLAN\]", cur_acc_text, re.DOTALL)
+                                    if m_plan:
+                                        p_text = m_plan.group(1).strip()
+                                        steps = [s.strip() for s in p_text.split("|") if s.strip()]
+                                        if steps and steps != planned_steps:
+                                            planned_steps = steps
+                                            current_step_idx = 0
+                                            log.info(f"📋 [随身语音识别出任务规划] 共 {len(steps)} 步: {steps}")
+                                            await maybe_patch_card(force=True)
+
+                                if on_sentence:
+                                    clean_delta = re.sub(r"\[TASK_PLAN\].*?\[/TASK_PLAN\]", "", delta, flags=re.DOTALL)
+                                    clean_delta = re.sub(r"\[TASK_PLAN\].*", "", clean_delta)
+                                    if clean_delta:
+                                        s_list = chunker.feed(clean_delta)
+                                        for s in s_list:
+                                            c_s = clean_text_for_speech(s)
+                                            if c_s:
+                                                emitted_sentences += 1
+                                                await on_sentence(c_s)
+                            elif st == "tool":
+                                t_state = su.get("state", "ACTIVE")
+                                t_name = su.get("tool_name") or su.get("name") or "tool"
+                                t_info = su.get("tool_info", {})
+                                if not isinstance(t_info, dict):
+                                    t_info = {}
+                                t_params = t_info.get("parameters") or t_info.get("args") or su.get("parameters") or su.get("args") or {}
+                                if not isinstance(t_params, dict):
+                                    t_params = {}
+                                summary = str(t_params.get("toolSummary", "") or t_params.get("toolAction", "")).strip(" \"'\n\r")
+                                target = (
+                                    t_params.get("CommandLine") or
+                                    t_params.get("TargetFile") or
+                                    t_params.get("AbsolutePath") or
+                                    t_params.get("query") or
+                                    t_params.get("Url") or ""
+                                )
+                                target = str(target).strip(" \"'\n\r")
+                                tool_item = {
+                                    "name": t_name,
+                                    "summary": summary or f"执行 {t_name}",
+                                    "target": target[:80] if target else "",
+                                    "output": ""
+                                }
+                                if t_state != "DONE":
+                                    executed_tools.append(tool_item)
+                                    if planned_steps:
+                                        current_step_idx = min(len(planned_steps) - 1, max(0, len(executed_tools) - 1))
+                                    log.info(f"🛠️ [硬件触发工具执行] {t_name}: {summary} ({target[:40]})")
+                                    await maybe_patch_card(active_tool=tool_item, force=True)
+                                else:
+                                    log.info(f"✅ [硬件触发工具完成] {t_name}: {summary}")
+                                    await maybe_patch_card(active_tool=None, force=True)
+                        elif evt_name == "result":
+                            res = evt.get("result", {})
+                            final_result_response = res.get("response", "")
+                    except Exception:
+                        pass
+
+                # 流结束时刷新剩余句子
+                if on_sentence:
+                    tail_list = chunker.flush()
+                    for s in tail_list:
+                        c_s = clean_text_for_speech(s)
+                        if c_s:
+                            emitted_sentences += 1
+                            await on_sentence(c_s)
+
+            await asyncio.wait_for(read_stream(), timeout=300.0)
+            await proc.wait()
+            stderr_bytes = await proc.stderr.read()
+            stderr_out = stderr_bytes.decode("utf-8", errors="ignore").strip()
+            log.info(f"agy 执行完毕 (RC={proc.returncode}, 发送分句数={emitted_sentences}, stderr={len(stderr_out)})")
+            if proc.returncode != 0 and stderr_out:
                 log.warning(f"agy 报错输出: {stderr_out[:200]}")
-            cleaned = clean_text_for_speech(output)
+
+            raw_full = final_result_response or "".join(accumulated_deltas)
+            cleaned = clean_text_for_speech(raw_full)
+
+            # 如果从未发射过分句（例如模型一次性给出），则发射整句
+            if emitted_sentences == 0 and cleaned and on_sentence:
+                emitted_sentences += 1
+                await on_sentence(cleaned)
+
             if cleaned:
                 stop_monitor.set()
                 await monitor_task
                 if active_t_path and os.path.exists(active_t_path):
-                    executed_tools = self.extract_session_tools_from_transcript(active_t_path)
+                    parsed_tools = self.extract_session_tools_from_transcript(active_t_path)
+                    if parsed_tools:
+                        executed_tools = parsed_tools
 
                 if chat_id:
                     self.update_bot_session_summary(chat_id, f"🎙️ [随身设备语音] {user_query}", cleaned)
@@ -1451,12 +2526,33 @@ class GatewayServer:
                     self.append_turn_to_transcript(conv_id, user_query, cleaned)
                 return cleaned, executed_tools
             else:
-                log.warning(f"AI 输出经过清理后为空，原始输出: {output[:100]}")
+                log.warning(f"AI 输出经过清理后为空，原始输出: {raw_full[:100]}")
+        except asyncio.CancelledError:
+            log.info("AI 推理任务被外部中断取消 (Barge-in / 打断)")
+            if proc and proc.returncode is None:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+            raise
         except asyncio.TimeoutError:
-            log.warning("AI 生成回复超时 (120s)")
+            log.warning("AI 生成回复超时 (300s)")
+            if proc and proc.returncode is None:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
         except Exception as e:
             log.error(f"AI 生成回复异常: {e}")
         finally:
+            if ws:
+                self.active_ai_procs.pop(ws, None)
             stop_monitor.set()
             if not monitor_task.done():
                 await monitor_task
@@ -1467,6 +2563,10 @@ class GatewayServer:
             fallback = f"执行「{user_query}」耗时超过限制，后台已执行 {len(executed_tools)} 个操作步骤，请在飞书卡片查看具体执行明细。"
         else:
             fallback = f"执行「{user_query}」响应超时，请稍后重试或在飞书直接下达。"
+
+        if emitted_sentences == 0 and on_sentence:
+            emitted_sentences += 1
+            await on_sentence(fallback)
 
         if chat_id:
             self.update_bot_session_summary(chat_id, f"🎙️ [随身设备语音] {user_query}", fallback)
@@ -1637,9 +2737,119 @@ class GatewayServer:
                 "detail": "Feishu: AI Analyzing..."
             }))
 
-        # 6. 调用 AI 大模型或极速直通生成分析回复
+        # 6. 【流式切片抢跑与重叠流水线】：创建句子队列与音频推流流水线
+        sentence_queue: asyncio.Queue = asyncio.Queue()
+        pcm_queue: asyncio.Queue = asyncio.Queue()
+        interrupted_ev = asyncio.Event()
+
+        def is_interrupted() -> bool:
+            return interrupted_ev.is_set() or ws.closed or ws not in self.active_websockets
+
+        # 协程A：TTS 合成流水线 (逐句取文本 -> Edge-TTS 预热连接池流式转码 -> 写入 pcm_queue)
+        async def tts_worker():
+            try:
+                while not is_interrupted():
+                    sentence = await sentence_queue.get()
+                    if sentence is None:
+                        # 所有分句已全部送达
+                        break
+                    clean_s = clean_text_for_speech(sentence)
+                    if not clean_s:
+                        sentence_queue.task_done()
+                        continue
+
+                    log.info(f"🔊 [流式TTS切片抢跑] 正在合成小句: 「{clean_s}」")
+
+                    async def _on_pcm_chunk(pcm_data: bytes):
+                        if not is_interrupted():
+                            await pcm_queue.put(pcm_data)
+
+                    stream_ok = await tts_pool.stream_pcm_realtime(
+                        text=clean_s,
+                        on_pcm_chunk=_on_pcm_chunk,
+                        check_interrupted=is_interrupted
+                    )
+                    if not stream_ok and not is_interrupted():
+                        # 若连接池偶发异常，降级到单句一次性合成
+                        fallback_pcm = await self.synthesize_speech_pcm(clean_s)
+                        if fallback_pcm and not is_interrupted():
+                            await pcm_queue.put(fallback_pcm)
+
+                    sentence_queue.task_done()
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                log.warning(f"TTS 流水线合成异常: {e}")
+            finally:
+                # 告知播放端：所有音频切片已合成完毕
+                await pcm_queue.put(None)
+
+        # 协程B：定速推流流水线 (从 pcm_queue 获取音频帧 -> 1920字节/0.056s 推送到硬件)
+        async def playback_worker():
+            speech_started = False
+            try:
+                while not is_interrupted():
+                    chunk = await pcm_queue.get()
+                    if chunk is None:
+                        # 全部音频播放完毕
+                        break
+                    if not speech_started and not ws.closed:
+                        speech_started = True
+                        log.info("🔊 [流水线播报] 首包音频到达，硬件即刻开播！")
+                        await ws.send_str(json.dumps({
+                            "type": "ai_state",
+                            "state": "speaking",
+                            "detail": "Feishu: Speaking..."
+                        }))
+                        await ws.send_str(json.dumps({"type": "voice_reply_start"}))
+
+                    # 严格定速推流 (16kHz 16-bit 单声道 = 32000 字节/秒，每 1920 字节 60ms)
+                    chunk_len = 1920
+                    for pos in range(0, len(chunk), chunk_len):
+                        if is_interrupted():
+                            break
+                        piece = chunk[pos:pos + chunk_len]
+                        if len(piece) < chunk_len:
+                            piece = piece + b"\x00" * (chunk_len - len(piece))
+                        await ws.send_bytes(piece)
+                        await asyncio.sleep(0.056)
+                    pcm_queue.task_done()
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                log.warning(f"定速推流硬件异常: {e}")
+            finally:
+                if speech_started and not is_interrupted() and not ws.closed:
+                    await ws.send_str(json.dumps({"type": "voice_reply_end"}))
+                    await ws.send_str(json.dumps({"type": "ai_speech_end"}))
+                    await ws.send_str(json.dumps({"type": "ai_state", "state": "idle", "detail": "Ready"}))
+                    log.info("设备语音流式播报完成，已切回待命状态")
+                elif not speech_started and not is_interrupted() and not ws.closed:
+                    log.warning("未触发音频流式播报，向硬件下发结束待命帧防止看门狗超时")
+                    if reply_text:
+                        await ws.send_str(json.dumps({"type": "ai_speech_start", "text": reply_text}))
+                    await ws.send_str(json.dumps({"type": "voice_reply_end"}))
+                    await ws.send_str(json.dumps({"type": "ai_speech_end"}))
+                    await ws.send_str(json.dumps({"type": "ai_state", "state": "idle", "detail": "Ready"}))
+
+        tts_task = asyncio.create_task(tts_worker())
+        play_task = asyncio.create_task(playback_worker())
+
+        first_slice_sent = False
+        async def on_sentence_slice(slice_text: str):
+            nonlocal first_slice_sent
+            if not is_interrupted() and slice_text:
+                await sentence_queue.put(slice_text)
+                if not first_slice_sent and not ws.closed:
+                    first_slice_sent = True
+                    await ws.send_str(json.dumps({"type": "ai_speech_start", "text": slice_text}))
+
+        # 7. 调用 AI 大模型生成分析回复 (流式逐句回调抢跑)
         executed_tools = []
         reply_text = ""
+        current_task = asyncio.current_task()
+        self.active_tts_tasks[ws] = current_task
+
         try:
             if user_text != "(未检测到有效语音)":
                 log.info(f"🤖 正在调用 AI 分析提问 (关联会话与全量Agent工具链)...")
@@ -1647,17 +2857,43 @@ class GatewayServer:
                     user_query=user_text,
                     mac=mac,
                     feishu_msg_id="",
-                    duration_sec=duration_sec
+                    feishu_msg_id_fut=feishu_msg_id_fut,
+                    duration_sec=duration_sec,
+                    on_sentence=on_sentence_slice,
+                    ws=ws
                 )
-                log.info(f"🤖 AI 生成回复: 「{reply_text}」 (实际执行工具数: {len(executed_tools)})")
+                log.info(f"🤖 AI 生成回复完毕: 「{reply_text[:60]}...」 (工具={len(executed_tools)})")
             else:
                 reply_text = "我没有听清您的说话内容，请长按确认键重新对我说话。"
+                await on_sentence_slice(reply_text)
 
+            if not ws.closed and reply_text:
+                await ws.send_str(json.dumps({"type": "ai_speech_start", "text": reply_text}))
+
+        except asyncio.CancelledError:
+            interrupted_ev.set()
+            tts_task.cancel()
+            play_task.cancel()
+            raise
         except Exception as e:
             log.error(f"AI 生成回复异常: {e}")
             reply_text = "抱歉，处理您的语音指令时出现异常，请稍后重试。"
+            await on_sentence_slice(reply_text)
+        finally:
+            # 发送分句结束标识符
+            await sentence_queue.put(None)
 
-        # 7. 【核心交互升级】：任务完成，后台刷新飞书卡片展示原生答复与工具执行记录
+        # 等待流水线全部播放完毕或被打断
+        try:
+            await asyncio.gather(tts_task, play_task, return_exceptions=True)
+        except Exception:
+            pass
+        finally:
+            self.active_ai_procs.pop(ws, None)
+            if self.active_tts_tasks.get(ws) == current_task:
+                self.active_tts_tasks.pop(ws, None)
+
+        # 8. 刷新飞书卡片展示最终原生答复与工具执行明细
         async def _async_update_card():
             try:
                 msg_id = await asyncio.wait_for(asyncio.shield(feishu_msg_id_fut), timeout=5.0)
@@ -1675,61 +2911,12 @@ class GatewayServer:
         asyncio.create_task(_async_update_card())
 
 
-        # 8 & 9. 【流式重叠抢跑流水线】：通过常驻 Edge-TTS 连接池边合成边定速推流硬件
-        if not ws.closed and reply_text:
-            log.info(f"🔊 启动极速流式抢跑语音播报: 「{reply_text[:20]}...」")
-            await ws.send_str(json.dumps({"type": "ai_speech_start", "text": reply_text[:60]}))
-            await ws.send_str(json.dumps({
-                "type": "ai_state",
-                "state": "speaking",
-                "detail": "Feishu: Speaking..."
-            }))
-            await ws.send_str(json.dumps({"type": "voice_reply_start"}))
-
-            # 严格定速推流 (16kHz 16-bit 单声道 = 32000 字节/秒，每 1920 字节 60ms)
-            async def handle_pcm_stream(pcm_chunk: bytes):
-                if ws.closed:
-                    return
-                # 将 pcm_chunk 按 1920 字节定速打入 WebSocket
-                chunk_len = 1920
-                for pos in range(0, len(pcm_chunk), chunk_len):
-                    if ws.closed:
-                        break
-                    piece = pcm_chunk[pos:pos + chunk_len]
-                    await ws.send_bytes(piece)
-                    await asyncio.sleep(0.056)
-
-            is_interrupted = lambda: ws.closed or ws not in self.active_websockets
-
-            stream_ok = await tts_pool.stream_pcm_realtime(
-                text=reply_text,
-                on_pcm_chunk=handle_pcm_stream,
-                check_interrupted=is_interrupted
-            )
-
-            if not stream_ok and not ws.closed:
-                # 若连接池偶发异常，平滑回退到一次性合成
-                fallback_pcm = await self.synthesize_speech_pcm(reply_text)
-                if fallback_pcm:
-                    for offset in range(0, len(fallback_pcm), 1920):
-                        if ws.closed:
-                            break
-                        await ws.send_bytes(fallback_pcm[offset:offset + 1920])
-                        await asyncio.sleep(0.058)
-
-            if not ws.closed:
-                await ws.send_str(json.dumps({"type": "voice_reply_end"}))
-                await ws.send_str(json.dumps({"type": "ai_speech_end"}))
-                await ws.send_str(json.dumps({"type": "ai_state", "state": "idle", "detail": "Ready"}))
-                log.info("设备语音播报完成，已切回待命状态")
-
-
     async def synthesize_speech_pcm(self, text: str) -> Optional[bytes]:
         """调用 edge-tts 生成音频并经 ffmpeg 转为 16kHz 16-bit 单声道 PCM"""
         try:
             import edge_tts
             voice = CONFIG.get("tts_voice", "zh-CN-XiaoxiaoNeural")
-            rate = CONFIG.get("tts_rate", "-5%")
+            rate = CONFIG.get("tts_rate", "+10%")
             with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as mp3_file:
                 mp3_path = mp3_file.name
 
@@ -1787,6 +2974,103 @@ class GatewayServer:
                 await ws.close()
             return web.json_response({"success": True})
         return web.json_response({"success": False, "error": "Missing mac"}, status=400)
+
+    async def play_voice_to_all(self, text: str):
+        """向所有在线硬件设备流式播放文本语音"""
+        try:
+            pcm = await self.synthesize_speech_pcm(text)
+            if not pcm:
+                return
+            for ws in list(self.active_websockets):
+                if ws.closed:
+                    continue
+                try:
+                    await ws.send_str(json.dumps({"type": "ai_speech_start", "text": text}))
+                    await ws.send_str(json.dumps({"type": "voice_reply_start"}))
+                    chunk_len = 1920
+                    for pos in range(0, len(pcm), chunk_len):
+                        if ws.closed:
+                            break
+                        piece = pcm[pos:pos + chunk_len]
+                        if len(piece) < chunk_len:
+                            piece = piece + b"\x00" * (chunk_len - len(piece))
+                        await ws.send_bytes(piece)
+                        await asyncio.sleep(0.056)
+                    if not ws.closed:
+                        await ws.send_str(json.dumps({"type": "voice_reply_end"}))
+                        await ws.send_str(json.dumps({"type": "ai_speech_end"}))
+                        await ws.send_str(json.dumps({"type": "ai_state", "state": "idle", "detail": "Ready"}))
+                except Exception as e_ws:
+                    log.warning(f"向设备播放语音异常: {e_ws}")
+        except Exception as e:
+            log.warning(f"合成播放异常: {e}")
+
+    async def handle_api_ring(self, request: web.Request) -> web.Response:
+        """寻机声光呼叫：向所有设备弹出居中报警弹窗并播报鸣叫语音"""
+        count = 0
+        for ws in list(self.active_websockets):
+            if not ws.closed:
+                count += 1
+                try:
+                    await ws.send_str(json.dumps({
+                        "type": "alert_popup",
+                        "title": "🔔 寻机呼叫",
+                        "content": "飞书控制台正呼叫本设备！"
+                    }))
+                except Exception:
+                    pass
+        if count > 0:
+            asyncio.create_task(self.play_voice_to_all("寻机呼叫！我在这里！"))
+            return web.json_response({"success": True, "alerted_clients": count, "message": "已下发寻机弹窗与语音播报"})
+        return web.json_response({"success": False, "error": "当前无在线设备连接"}, status=400)
+
+    async def handle_api_voice(self, request: web.Request) -> web.Response:
+        """动态切换播报音色并立即向设备播报测试语音"""
+        try:
+            data = await request.json()
+            new_voice = data.get("voice", "")
+            if not new_voice:
+                return web.json_response({"success": False, "error": "Missing voice"}, status=400)
+            CONFIG["tts_voice"] = new_voice
+            try:
+                with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+                    json.dump(CONFIG, f, indent=2, ensure_ascii=False)
+            except Exception:
+                pass
+            global tts_pool
+            tts_pool.voice = new_voice
+            tts_pool.cfg = TTSConfig(new_voice, tts_pool.rate, "+0%", "+0Hz", "SentenceBoundary")
+            tts_pool._connected = False
+            asyncio.create_task(self.play_voice_to_all("已切换播报音色"))
+            return web.json_response({"success": True, "voice": new_voice})
+        except Exception as e:
+            return web.json_response({"success": False, "error": str(e)}, status=500)
+
+    async def handle_api_speak(self, request: web.Request) -> web.Response:
+        """向所有在线硬件播报指定文本并弹窗显示"""
+        try:
+            data = await request.json()
+            text = (data.get("text") or "").strip()
+            if not text:
+                return web.json_response({"success": False, "error": "文本内容不能为空"}, status=400)
+            count = 0
+            for ws in list(self.active_websockets):
+                if not ws.closed:
+                    count += 1
+                    try:
+                        await ws.send_str(json.dumps({
+                            "type": "alert_popup",
+                            "title": "📢 语音播报",
+                            "content": text[:80]
+                        }))
+                    except Exception:
+                        pass
+            if count > 0:
+                asyncio.create_task(self.play_voice_to_all(text))
+                return web.json_response({"success": True, "count": count, "text": text})
+            return web.json_response({"success": False, "error": "当前无在线硬件连接，无法播放"}, status=400)
+        except Exception as e:
+            return web.json_response({"success": False, "error": str(e)}, status=500)
 
 
 async def main():
